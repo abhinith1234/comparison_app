@@ -681,6 +681,7 @@ function OcrToExcelMode() {
       const filename = nameMatch ? nameMatch[1] : "ocr_extract.xlsx";
       const formCount = parseInt(res.headers.get("x-form-count") || "0", 10);
       const imageCount = parseInt(res.headers.get("x-image-count") || "0", 10);
+      const partials = res.headers.get("x-partial-forms") || "";
 
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -692,7 +693,12 @@ function OcrToExcelMode() {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
 
-      setDone({ filename, formCount, imageCount });
+      setDone({
+        filename,
+        formCount,
+        imageCount,
+        partialForms: partials ? partials.split(",").map((s) => s.trim()).filter(Boolean) : []
+      });
     } catch (err) {
       setError(err.message);
     } finally {
@@ -753,6 +759,20 @@ function OcrToExcelMode() {
             <p className="hint">
               Check your downloads folder. Run again to refresh with new images.
             </p>
+
+            {done.partialForms && done.partialForms.length > 0 && (
+              <div className="excel-partial-warning">
+                <div className="warning-title">⚠️ Partial / Cut-off Forms Skipped</div>
+                <p className="warning-desc">
+                  The following form IDs were found at the top or bottom edges of the page, detected as cut-off (partial), and skipped to prevent incomplete data rows:
+                </p>
+                <ul className="partial-list">
+                  {done.partialForms.map((id, index) => (
+                    <li key={index}>Form ID: <strong>{id}</strong></li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         )}
       </section>

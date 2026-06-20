@@ -49,7 +49,7 @@ def _reading_order(boxes: list[Box], row_tol: int) -> list[Box]:
     return ordered
 
 
-def detect_form_boxes(bgr: np.ndarray) -> list[Box]:
+def detect_form_boxes_categorized(bgr: np.ndarray) -> tuple[list[Box], list[Box]]:
     H, W = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
@@ -68,12 +68,36 @@ def detect_form_boxes(bgr: np.ndarray) -> list[Box]:
             cands.append((x, y, w, h))
 
     boxes = _nms(cands)
-    # A single form fills the frame: nothing useful to split.
+    # A single form fills the frame: nothing useful to split, treated as full
     if len(boxes) <= 1:
-        return [(0, 0, W, H)]
+        return [(0, 0, W, H)], []
 
-    row_tol = int(np.median([b[3] for b in boxes]) * 0.5)
-    return _reading_order(boxes, row_tol)
+    # Calculate median height of detected boxes
+    median_h = float(np.median([b[3] for b in boxes]))
+
+    full_boxes = []
+    partial_boxes = []
+    for box in boxes:
+        x, y, w, h = box
+        # If height is significantly smaller than the median height, it is partial
+        if h < median_h * 0.88:
+            partial_boxes.append(box)
+        # If it touches the top/bottom boundary and is smaller than typical height
+        elif (y <= 15 or (y + h) >= H - 15) and h < median_h * 0.96:
+            partial_boxes.append(box)
+        else:
+            full_boxes.append(box)
+
+    row_tol = int(median_h * 0.5)
+    full_ordered = _reading_order(full_boxes, row_tol)
+    partial_ordered = _reading_order(partial_boxes, row_tol)
+
+    return full_ordered, partial_ordered
+
+
+def detect_form_boxes(bgr: np.ndarray) -> list[Box]:
+    full_boxes, _ = detect_form_boxes_categorized(bgr)
+    return full_boxes
 
 
 def crop_boxes(bgr: np.ndarray, boxes: list[Box], pad: int = 4) -> list[np.ndarray]:

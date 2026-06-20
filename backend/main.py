@@ -549,6 +549,8 @@ async def ocr_to_excel(images: list[UploadFile] = File(...)):
     crops_bgr: list[np.ndarray] = []
     meta: list[dict] = []
     order: list[str] = []
+    
+    partial_encoded: list[bytes] = []
 
     for up in images:
         name = up.filename or f"image_{len(order)}"
@@ -559,13 +561,41 @@ async def ocr_to_excel(images: list[UploadFile] = File(...)):
         bgr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
         if bgr is None:
             continue
-        crops = segmenter.crop_boxes(bgr, segmenter.detect_form_boxes(bgr))
+        
+        full_boxes, partial_boxes = segmenter.detect_form_boxes_categorized(bgr)
+        
+        # Process full boxes
+        crops = segmenter.crop_boxes(bgr, full_boxes)
         for box_i, crop in enumerate(crops):
             encoded.append(cv2.imencode(".png", crop)[1].tobytes())
             crops_bgr.append(crop)
             meta.append({"image_name": name, "box": box_i})
+            
+        # Crop partial boxes
+        p_crops = segmenter.crop_boxes(bgr, partial_boxes)
+        for p_crop in p_crops:
+            partial_encoded.append(cv2.imencode(".png", p_crop)[1].tobytes())
 
     ocr_details = extract_text_detail_batch(encoded)
+    
+    # Process partial boxes to extract their IDs
+    partial_ids = []
+    if partial_encoded:
+        partial_ocr_details = extract_text_detail_batch(partial_encoded)
+        for detail in partial_ocr_details:
+            text = detail["text"]
+            rec = match_record_by_number(records, text)
+            if rec:
+                rec_no = rec.get("record_no", "")
+                numeric_id = re.sub(r"\D", "", str(rec_no))
+                if numeric_id:
+                    partial_ids.append(numeric_id)
+                    continue
+            m = re.search(r'\b(61\d{3}|63\d{3})\b', text)
+            if m:
+                partial_ids.append(m.group(1))
+            else:
+                partial_ids.append("Unknown")
 
     # ── build Excel workbook ───────────────────────────────────────────────
     wb = openpyxl.Workbook()
@@ -632,5 +662,7 @@ async def ocr_to_excel(images: list[UploadFile] = File(...)):
             "Content-Disposition": f'attachment; filename="ocr_extract_{ts}.xlsx"',
             "X-Form-Count": str(len(meta)),
             "X-Image-Count": str(len(order)),
+            "X-Partial-Forms": ",".join(partial_ids),
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Form-Count, X-Image-Count, X-Partial-Forms",
         },
     )
