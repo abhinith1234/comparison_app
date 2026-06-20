@@ -654,9 +654,21 @@ function OcrToExcelMode() {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [done, setDone] = useState(null); // { filename, formCount, imageCount }
+  const [done, setDone] = useState(null); // { filename, formCount, imageCount, url, partialForms }
+
+  // Clean up Blob URLs to prevent memory leaks when done changes or unmounts
+  useEffect(() => {
+    return () => {
+      if (done && done.url) {
+        URL.revokeObjectURL(done.url);
+      }
+    };
+  }, [done]);
 
   function onFiles(e) {
+    if (done && done.url) {
+      URL.revokeObjectURL(done.url);
+    }
     setFiles(Array.from(e.target.files || []));
     setDone(null);
     setError("");
@@ -665,6 +677,9 @@ function OcrToExcelMode() {
   async function onRun(e) {
     e.preventDefault();
     if (!files.length) return setError("Upload one or more images.");
+    if (done && done.url) {
+      URL.revokeObjectURL(done.url);
+    }
     setLoading(true);
     setError("");
     setDone(null);
@@ -691,12 +706,12 @@ function OcrToExcelMode() {
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(url);
 
       setDone({
         filename,
         formCount,
         imageCount,
+        url,
         partialForms: partials ? partials.split(",").map((s) => s.trim()).filter(Boolean) : []
       });
     } catch (err) {
@@ -756,7 +771,10 @@ function OcrToExcelMode() {
               {done.imageCount} image(s) · {done.formCount} form(s) extracted
             </p>
             <p className="excel-filename">{done.filename}</p>
-            <p className="hint">
+            <a href={done.url} download={done.filename} className="btn-excel-download">
+              📥 Download Excel Again
+            </a>
+            <p className="hint" style={{ marginTop: "12px" }}>
               Check your downloads folder. Run again to refresh with new images.
             </p>
 

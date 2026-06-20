@@ -980,6 +980,31 @@ th.serial {
   margin-bottom: 4px;
 }
 
+.btn-excel-download {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  cursor: pointer;
+  border: none;
+  border-radius: 10px;
+  padding: 11px 22px;
+  font-size: 14px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(135deg, #10b981, #059669);
+  box-shadow: 0 10px 22px -12px rgba(16, 185, 129, 0.8);
+  transition: transform 0.08s, box-shadow 0.15s, filter 0.15s;
+  margin-top: 14px;
+}
+.btn-excel-download:hover {
+  filter: brightness(1.05);
+  box-shadow: 0 4px 12px -8px rgba(16, 185, 129, 0.4);
+}
+.btn-excel-download:active {
+  transform: translateY(1px);
+}
+
 @media (max-width: 820px) {
   .layout {
     grid-template-columns: 1fr;
