@@ -135,6 +135,24 @@ echo -e "${GREEN}║    OCR Form Validator – startup script   ║${RESET}"
 echo -e "${GREEN}╚══════════════════════════════════════════╝${RESET}"
 echo ""
 
+# Pull latest changes from git
+if command -v git &>/dev/null; then
+    log "Checking for updates from repository..."
+    git pull
+else
+    # Also check typical Windows Git installation if running in Git Bash/MSYS
+    if [[ -f "/c/Program Files/Git/cmd/git.exe" ]]; then
+        log "Checking for updates from repository (using absolute Git path)..."
+        "/c/Program Files/Git/cmd/git.exe" pull
+    elif [[ -f "C:\Program Files\Git\cmd\git.exe" ]]; then
+        log "Checking for updates from repository (using absolute Git path)..."
+        "C:\Program Files\Git\cmd\git.exe" pull
+    else
+        warn "Git not found in PATH – skipping repository updates check."
+    fi
+fi
+echo ""
+
 # parse args – first arg may be a mode flag; --reinstall can appear anywhere
 MODE=""
 REINSTALL=""

@@ -7,6 +7,21 @@ echo    OCR Form Validator Setup ^& Launcher
 echo ==========================================
 echo.
 
+:: Pull latest changes from git
+where git >nul 2>nul
+if %errorlevel% equ 0 (
+    echo [SYSTEM] Checking for updates from repository...
+    git pull
+) else (
+    if exist "C:\Program Files\Git\cmd\git.exe" (
+        echo [SYSTEM] Checking for updates from repository (using absolute Git path)...
+        "C:\Program Files\Git\cmd\git.exe" pull
+    ) else (
+        echo [WARNING] Git not found in PATH or standard location. Skipping auto-update.
+    )
+)
+echo.
+
 :: Check for Python
 where python >nul 2>nul
 if %errorlevel% neq 0 (
