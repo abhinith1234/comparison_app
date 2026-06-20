@@ -191,29 +191,126 @@ def scrape(
     }
 
 
+def parse_excel_records(file_bytes: bytes) -> list[dict]:
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("Excel file is empty.")
+
+    header_row = rows[0]
+    if not header_row:
+        raise ValueError("Excel header row is empty.")
+
+    col_map = {}
+    normalized_labels = {k.strip().lower(): k for k in LABELS}
+    normalized_source_keys = {SOURCE_KEY[k].strip().lower(): k for k in SOURCE_KEY}
+    normalized_field_keys = {k.strip().lower(): k for k in FIELD_ORDER}
+
+    for col_idx, cell in enumerate(header_row):
+        if cell is None:
+            continue
+        val = str(cell).strip().lower()
+
+        if val in normalized_field_keys:
+            col_map[col_idx] = normalized_field_keys[val]
+        elif val in normalized_labels:
+            col_map[col_idx] = normalized_labels[val]
+        elif val in normalized_source_keys:
+            col_map[col_idx] = normalized_source_keys[val]
+        else:
+            matched_key = None
+            for k, label in LABELS.items():
+                if label.strip().lower() == val:
+                    matched_key = k
+                    break
+            if matched_key:
+                col_map[col_idx] = matched_key
+            else:
+                for k, src_k in SOURCE_KEY.items():
+                    if src_k.strip().lower() == val:
+                        matched_key = k
+                        break
+                if matched_key:
+                    col_map[col_idx] = matched_key
+
+    # Check for record_no column mapping
+    if not any(k == "record_no" for k in col_map.values()):
+        for col_idx, cell in enumerate(header_row):
+            if cell is None:
+                continue
+            val = str(cell).strip().lower()
+            if val == "id":
+                col_map[col_idx] = "record_no"
+                break
+
+    if not any(k == "record_no" for k in col_map.values()):
+        raise ValueError("Could not find 'Record No' or 'ID' column in Excel file.")
+
+    records = []
+    for row_values in rows[1:]:
+        if not any(cell is not None for cell in row_values):
+            continue
+
+        record = {}
+        for k in FIELD_ORDER:
+            record[k] = ""
+
+        for col_idx, val in enumerate(row_values):
+            if col_idx in col_map:
+                key = col_map[col_idx]
+                if val is None:
+                    record[key] = ""
+                else:
+                    record[key] = str(val).strip()
+
+        records.append(record)
+
+    return records
+
+
 @app.post("/upload-data")
 async def upload_data(file: UploadFile = File(...)):
-    """Accept a pre-scraped JSON file and save it as the active data source.
+    """Accept a pre-scraped JSON file or Excel file and save it as the active data source.
 
-    The uploaded file must be a JSON array of record objects (the same format
-    produced by /scrape).  It is saved as scraped_<timestamp>.json in DATA_DIR
-    so it becomes the file that /records and /validate use going forward.
+    It is saved as scraped_<timestamp>.json in DATA_DIR so it becomes the file that
+    /records and /validate use going forward.
     """
-    if not file.filename or not file.filename.lower().endswith(".json"):
-        raise HTTPException(status_code=400, detail="Only .json files are accepted.")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Invalid file name.")
+
+    filename_lower = file.filename.lower()
+    is_json = filename_lower.endswith(".json")
+    is_excel = filename_lower.endswith(".xlsx") or filename_lower.endswith(".xls")
+
+    if not is_json and not is_excel:
+        raise HTTPException(
+            status_code=400, detail="Only .json or .xlsx Excel files are accepted."
+        )
 
     raw = await file.read()
-    try:
-        records = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid JSON: {exc}"
-        ) from exc
+
+    if is_json:
+        try:
+            records = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid JSON: {exc}"
+            ) from exc
+    else:
+        # Parse Excel using openpyxl
+        try:
+            records = parse_excel_records(raw)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid Excel file or format: {exc}"
+            ) from exc
 
     if not isinstance(records, list):
         raise HTTPException(
             status_code=400,
-            detail="JSON must be a top-level array of record objects.",
+            detail="Data must represent a list of record objects.",
         )
     if not records:
         raise HTTPException(status_code=400, detail="Uploaded file contains no records.")
@@ -222,7 +319,7 @@ async def upload_data(file: UploadFile = File(...)):
     out = DATA_DIR / f"scraped_{ts}.json"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as fh:
-        fh.write(raw.decode("utf-8"))
+        json.dump(records, fh, indent=2, ensure_ascii=False)
 
     return {
         "saved_file": out.name,

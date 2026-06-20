@@ -927,12 +927,12 @@ export default function App() {
                 <label className="file-pick-label" htmlFor="upload-data-input">
                   <span className="file-pick-icon">📎</span>
                   <span className="file-pick-name">
-                    {uploadFile ? uploadFile.name : "Choose .json file…"}
+                    {uploadFile ? uploadFile.name : "Choose .json or .xlsx file…"}
                   </span>
                   <input
                     id="upload-data-input"
                     type="file"
-                    accept=".json,application/json"
+                    accept=".json,application/json,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xls"
                     onChange={(e) =>
                       setUploadFile(e.target.files?.[0] || null)
                     }
