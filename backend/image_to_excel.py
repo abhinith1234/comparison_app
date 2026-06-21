@@ -189,11 +189,7 @@ def extract_row(text: str) -> list:
         val = re.sub(r"['\"‘’“”]", "", val)
         
         if ON_FORM.get(key):
-            # 5. Missing / Not Applicable Data
-            if not val or val.replace(".", "").strip().upper() in ("NA", "N/A"):
-                val = "N.A. (AS PER IMAGE)"
-                remarks.append(f"{label.upper()} NOT GIVEN")
-            else:
+            if val:
                 # 1. Phone Number
                 if "phone" in key.lower():
                     digits = re.sub(r"\D", "", val)

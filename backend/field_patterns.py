@@ -342,6 +342,8 @@ def canonicalize(key, value):
     if not value:
         return value
     v = value.strip()
+    if "?" in v:
+        return v
     if key in CANON_ENUM:
         opts = CANON_ENUM[key]
         best = max(opts, key=lambda o: fuzz.ratio(v.upper(), o.upper()))
