@@ -84,30 +84,21 @@ def compare_key(value: str) -> str:
     return key.translate(_AMBIGUOUS)
 
 
-def _align(expected_strs, expected_lens, tokens, strict: bool = True):
+def _align(expected_strs, expected_lens, tokens):
     """Order-preserving DP alignment of expected values to OCR tokens.
 
     Fuzzy similarity is used here only to find each field's span.
     Returns a (start, end) span into `tokens` for each field.
 
-    strict=True  (validation path)
-        Tighter search window (target_len + 2) and a higher recovery threshold
-        (55) so the aligner does not over-reach and produce false matches that
-        would wrongly pass a validation check.
-
-    strict=False  (extraction / OCR-to-Excel path)
-        Wider search window (target_len + 4) and a lower recovery threshold for
-        short single-token values like Yes/No (40) so every question field gets
-        its answer even when many consecutive identical tokens appear in a row.
+    The alignment uses a liberal search window (target_len + 4 extra tokens)
+    and a low recovery threshold for single-token values (40 for Yes/No).
+    Validation strictness comes from the EXACT character comparison in
+    compare_record(), not from restricting the search window here.
     """
     n = len(expected_strs)
     m = len(tokens)
     if n == 0:
         return []
-
-    # Per-mode tuning
-    extra_window  = 2 if strict else 4   # tokens beyond target_len to search
-    recovery_base = 55                    # minimum score for the recovery pass
 
     def window_score(idx, start, end):
         return fuzz.ratio(expected_strs[idx], collapse(" ".join(tokens[start:end])))
@@ -118,7 +109,9 @@ def _align(expected_strs, expected_lens, tokens, strict: bool = True):
 
     for i in range(1, n + 1):
         target_len    = max(1, expected_lens[i - 1])
-        search_window = target_len + extra_window
+        # Allow up to target_len + 4 extra tokens so long multi-word values
+        # (addresses, names) and dense 50-field forms still align correctly.
+        search_window = target_len + 4
         pref_val = [NEG] * (m + 1)
         pref_arg = [0] * (m + 1)
         run, run_arg = NEG, 0
@@ -184,13 +177,9 @@ def _align(expected_strs, expected_lens, tokens, strict: bool = True):
                 )
                 if sc > best_score:
                     best_score, best_span = sc, (start, end)
-        # Extraction mode lowers the threshold for single-token values (Yes/No)
-        # because their maximum possible fuzz score is inherently lower when
-        # they compete with longer surrounding context.
-        if strict:
-            min_score = recovery_base
-        else:
-            min_score = 40 if target <= 1 else recovery_base
+        # Lower threshold for single-token values (Yes/No) since fuzz.ratio
+        # between a 2-char string and surrounding context is inherently lower.
+        min_score = 40 if target <= 1 else 55
         if best_span and best_score >= min_score:
             spans[i] = best_span
             for t in range(best_span[0], best_span[1]):
@@ -209,16 +198,14 @@ def _union_box(boxes):
     ]
 
 
-def compare_record(record: dict, ocr_text: str, token_boxes=None, strict: bool = True) -> dict:
+def compare_record(record: dict, ocr_text: str, token_boxes=None) -> dict:
     """Compare a stored CRM record against OCR text from the scanned form.
 
-    strict=True  (default) – used by the validation endpoints (/validate,
-        /validate-batch).  Tight alignment so a near-miss never passes.
-
-    strict=False – used by the OCR-to-Excel extraction endpoint.
-        Wider alignment window + lower recovery threshold so every field
-        (especially Policy Holder address fields and Yes/No questions) gets
-        its value even when many consecutive identical tokens appear.
+    Used by both validation and extraction.  Alignment is always liberal
+    (wide window, low recovery threshold for Yes/No) so the DP can locate
+    all ~50 fields reliably.  Validation strictness is enforced by the
+    exact character comparison (compare_key) further below — not by
+    restricting the search window.
     """
     tokens = collapse(ocr_text).split()
     # Same tokens but with original letter case preserved (collapse() upper-cases
@@ -233,7 +220,7 @@ def compare_record(record: dict, ocr_text: str, token_boxes=None, strict: bool =
     ]
     expected_strs = [collapse(record.get(key, "")) for key in align_keys]
     expected_lens = [len(s.split()) for s in expected_strs]
-    spans = _align(expected_strs, expected_lens, tokens, strict=strict)
+    spans = _align(expected_strs, expected_lens, tokens)
     span_by_key = {align_keys[i]: spans[i] for i in range(len(align_keys))}
 
     field_results = []
@@ -281,6 +268,17 @@ def compare_record(record: dict, ocr_text: str, token_boxes=None, strict: bool =
 
         start, end = span_by_key[key]
         found = " ".join(disp_tokens[start:end])
+
+        if not found.strip():
+            # Alignment returned an empty span: OCR couldn't locate this field's
+            # value in the text.  Count as a mismatch with a dedicated status so
+            # the UI can display "OCR missed" distinctly from "OCR read wrong value".
+            mismatched += 1
+            field_results.append(
+                _row(key, serial, label, raw, "", 0.0, "ocr_missed")
+            )
+            continue
+
         is_exact = compare_key(raw) == compare_key(found)
         score = round(fuzz.ratio(compare_key(raw), compare_key(found)), 1)
         status = "match" if is_exact else "mismatch"

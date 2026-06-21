@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import * as XLSX from "xlsx";
 import {
   applyOverrides,
   buildReportHtml,
@@ -39,6 +40,7 @@ const STATUS_META = {
   match: { label: "Match", cls: "st-match" },
   partial: { label: "Partial", cls: "st-partial" },
   mismatch: { label: "Mismatch", cls: "st-mismatch" },
+  ocr_missed: { label: "OCR missed", cls: "st-missed" },
   not_on_form: { label: "Not on form", cls: "st-skipped" },
   calculated: { label: "Calculated", cls: "st-calc" },
   false_positive: { label: "False positive (scan error)", cls: "st-fp" },
@@ -121,23 +123,30 @@ function ReportTable({ result, overrides, onToggle, onNote }) {
       </thead>
       <tbody>
         {result.fields.map((f) => {
-          const meta = STATUS_META[f.status];
+          const meta = STATUS_META[f.status] || STATUS_META.mismatch;
           const reviewable =
-            f.status === "mismatch" || f.status === "false_positive";
+            f.status === "mismatch" || f.status === "false_positive" || f.status === "ocr_missed";
           const marked = f.status === "false_positive";
           const diff =
             f.status === "mismatch"
               ? diffSegments(f.expected, f.found || "")
               : null;
+          const foundDisplay =
+            f.status === "ocr_missed"
+              ? <span className="ocr-missed-label">— not found by OCR</span>
+              : (f.found || "—");
           return (
-            <tr key={f.field}>
+            <tr key={f.field} className={f.status === "ocr_missed" ? "row-missed" : ""}>
               <td className="serial">{f.serial}</td>
               <td>{f.label}</td>
-              <td>
+              <td className={f.status === "ocr_missed" ? "expected-missed" : ""}>
                 <DiffCell segments={diff?.expected} fallback={f.expected} />
               </td>
               <td className="found">
-                <DiffCell segments={diff?.found} fallback={f.found || "—"} />
+                {diff
+                  ? <DiffCell segments={diff.found} fallback={f.found || "—"} />
+                  : foundDisplay
+                }
               </td>
               <td className="score">{f.score == null ? "—" : f.score}</td>
               <td>
@@ -309,6 +318,11 @@ function SingleMode({ records }) {
               <span className="st-mismatch">
                 Mismatched {effective.summary.mismatched}
               </span>
+              {(effective.fields?.filter(f => f.status === "ocr_missed").length || 0) > 0 && (
+                <span className="st-missed">
+                  OCR missed {effective.fields.filter(f => f.status === "ocr_missed").length}
+                </span>
+              )}
               {effective.summary.false_positive > 0 && (
                 <span className="st-fp">
                   False positives {effective.summary.false_positive}
@@ -654,6 +668,7 @@ function OcrToExcelMode() {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [progress, setProgress] = useState(null);
   const [done, setDone] = useState(null); // { filename, formCount, imageCount, url, partialForms }
 
   // Clean up Blob URLs to prevent memory leaks when done changes or unmounts
@@ -669,7 +684,9 @@ function OcrToExcelMode() {
     if (done && done.url) {
       URL.revokeObjectURL(done.url);
     }
-    setFiles(Array.from(e.target.files || []));
+    const selected = Array.from(e.target.files || []);
+    selected.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+    setFiles(selected);
     setDone(null);
     setError("");
   }
@@ -683,22 +700,76 @@ function OcrToExcelMode() {
     setLoading(true);
     setError("");
     setDone(null);
-    try {
-      const body = new FormData();
-      files.forEach((f) => body.append("images", f));
-      const res = await fetch(`${API}/ocr-to-excel`, { method: "POST", body });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `Server error ${res.status}`);
-      }
-      const cd = res.headers.get("content-disposition") || "";
-      const nameMatch = cd.match(/filename="([^"]+)"/);
-      const filename = nameMatch ? nameMatch[1] : "ocr_extract.xlsx";
-      const formCount = parseInt(res.headers.get("x-form-count") || "0", 10);
-      const imageCount = parseInt(res.headers.get("x-image-count") || "0", 10);
-      const partials = res.headers.get("x-partial-forms") || "";
+    setProgress({ done: 0, total: files.length });
 
-      const blob = await res.blob();
+    try {
+      let pending = [];
+      let allRows = [];
+      let header = null;
+      let totalElapsed = 0;
+      let imageCount = files.length;
+
+      for (let i = 0; i < files.length; i += BATCH_CHUNK) {
+        const group = files.slice(i, i + BATCH_CHUNK);
+        setProgress({ done: i, total: files.length });
+        
+        const body = new FormData();
+        group.forEach((f) => body.append("images", f));
+        body.append("carry", JSON.stringify(pending));
+        body.append("flush", "false");
+
+        const res = await fetch(`${API}/extract`, { method: "POST", body });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.detail || `Server error ${res.status}`);
+        }
+        
+        const json = await res.json();
+        if (!header && json.header) header = json.header;
+        if (json.rows) allRows.push(...json.rows);
+        pending = json.pending || [];
+        totalElapsed += json.elapsed_seconds || 0;
+        
+        setProgress({ done: Math.min(i + BATCH_CHUNK, files.length), total: files.length });
+      }
+
+      // Final flush if there are any pending partials
+      if (pending.length > 0) {
+        const body = new FormData();
+        body.append("carry", JSON.stringify(pending));
+        body.append("flush", "true");
+        const res = await fetch(`${API}/extract`, { method: "POST", body });
+        if (res.ok) {
+           const json = await res.json();
+           if (json.rows) allRows.push(...json.rows);
+           totalElapsed += json.elapsed_seconds || 0;
+        }
+      }
+
+      // Generate Excel using xlsx package
+      if (!header) header = ["ID"];
+      const ws = XLSX.utils.aoa_to_sheet([header, ...allRows]);
+      
+      // Basic styling: auto-width approximations
+      const colWidths = header.map((h, i) => {
+        let max = h.length;
+        for (let row of allRows) {
+          const val = row[i] != null ? String(row[i]) : "";
+          if (val.length > max) max = val.length;
+        }
+        return { wch: Math.min(max + 2, 42) };
+      });
+      ws['!cols'] = colWidths;
+      
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "OCR Extract");
+      
+      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      const blob = new Blob([wbout], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+
+      const ts = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+      const filename = `ocr_extract_${ts}.xlsx`;
+      
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -709,15 +780,17 @@ function OcrToExcelMode() {
 
       setDone({
         filename,
-        formCount,
+        formCount: allRows.length,
         imageCount,
         url,
-        partialForms: partials ? partials.split(",").map((s) => s.trim()).filter(Boolean) : []
+        elapsed: Math.round(totalElapsed * 10) / 10,
+        partialForms: []
       });
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
+      setProgress(null);
     }
   }
 
@@ -758,6 +831,9 @@ function OcrToExcelMode() {
             <div className="excel-spinner" />
             <p className="excel-loading-text">
               Running OCR on {files.length} image(s)…
+              {progress && (
+                <><br/><span>Processed {progress.done} of {progress.total} image(s)...</span></>
+              )}
               <br />
               <span>This may take a moment for large batches.</span>
             </p>
@@ -769,6 +845,9 @@ function OcrToExcelMode() {
             <h3>Excel downloaded!</h3>
             <p className="sub">
               {done.imageCount} image(s) · {done.formCount} form(s) extracted
+            </p>
+            <p className="sub" style={{ marginTop: '4px', fontSize: '0.9em', color: '#6b7280' }}>
+              Extracted in {done.elapsed}s
             </p>
             <p className="excel-filename">{done.filename}</p>
             <a href={done.url} download={done.filename} className="btn-excel-download">

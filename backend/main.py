@@ -29,7 +29,7 @@ from pydantic import BaseModel
 import segmenter
 from comparator import compare_record
 from fields import FIELD_ORDER, LABELS, ON_FORM
-from ocr_engine import extract_text, extract_text_detail_batch
+from ocr_engine import extract_text, extract_text_detail_batch, extract_text_batch
 
 import os
 
@@ -482,6 +482,10 @@ def _fill_empty_found(result: dict) -> dict:
     for f in result["fields"]:
         if not ON_FORM.get(f["field"]):
             continue
+        # Don't promote a genuine ocr_missed to a match — that would hide the
+        # fact that the aligner found nothing for this field.
+        if f["status"] == "ocr_missed":
+            continue
         found_val = str(f.get("found", "")).strip()
         expected_val = str(f.get("expected", "")).strip()
         if not found_val and expected_val and f["status"] in ("mismatch",):
@@ -592,8 +596,8 @@ async def validate_batch(images: list[UploadFile] = File(...)):
                 }
             )
             continue
-        result = compare_record(record, ocr_text, token_boxes, strict=True)  # validation
-        result = _fill_empty_found(result)
+        result = compare_record(record, ocr_text, token_boxes)  # validation
+        # No fill_empty_found: ocr_missed and mismatch must stay visible.
         boxes = [f.get("box") for f in result["fields"] if f.get("box")]
         result.update(
             {
@@ -646,8 +650,8 @@ async def validate(form_no: str = Form(...), image: UploadFile = File(...)):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"OCR failed: {exc}") from exc
 
-    result = compare_record(record, ocr_text, strict=True)  # validation
-    result = _fill_empty_found(result)
+    result = compare_record(record, ocr_text)  # validation
+    # No fill_empty_found: ocr_missed and mismatch must stay visible.
     result.update(
         {
             "record_no": record.get("record_no"),
@@ -662,33 +666,37 @@ async def validate(form_no: str = Form(...), image: UploadFile = File(...)):
     return result
 
 
-@app.post("/ocr-to-excel")
-async def ocr_to_excel(images: list[UploadFile] = File(...)):
-    """OCR every detected form across all uploaded images and return a
-    single Excel workbook in the same column layout as the CRM export:
+from image_to_excel import HEADER as EXTRACT_HEADER, extract_row, stitch_texts
 
-      Column 1 : ID  – numeric digits extracted from record_no
-                       (e.g. "63135" from "L_I@63135")
-      Columns 2+: every CRM field in FIELD_ORDER, excluding form_no
-                  (form_no is a CRM-internal key, not printed on the form)
 
-    One row per detected form box.  Matched forms (green) carry the
-    OCR-extracted values; unmatched forms (amber) are blank rows so
-    nothing is silently dropped.
-    """
-    records = load_records()
+@app.post("/extract")
+async def extract_forms(
+    images: list[UploadFile] = File(default=[]),
+    carry: str = Form(default="[]"),
+    flush: str = Form(default="false")
+):
+    started = time.time()
+    try:
+        pending = json.loads(carry)
+    except Exception:
+        pending = []
 
-    # Fields to export – mirror the CRM layout; form_no is absent there
-    # because it is a CRM-internal key, not a value printed on the form.
-    export_keys = [k for k in FIELD_ORDER if k != "form_no"]
+    flush_bool = str(flush).lower() == "true"
 
-    # ── detect + crop all form boxes (same as validate-batch) ─────────────
+    if flush_bool or not images:
+        rows = [extract_row(t) for t in pending]
+        return {
+            "header": EXTRACT_HEADER,
+            "rows": rows,
+            "count": len(rows),
+            "pending": [],
+            "images": [],
+            "elapsed_seconds": round(time.time() - started, 1),
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")
+        }
+
     encoded: list[bytes] = []
-    crops_bgr: list[np.ndarray] = []
-    meta: list[dict] = []
     order: list[str] = []
-    
-    partial_encoded: list[bytes] = []
 
     for up in images:
         name = up.filename or f"image_{len(order)}"
@@ -700,108 +708,22 @@ async def ocr_to_excel(images: list[UploadFile] = File(...)):
         if bgr is None:
             continue
         
-        full_boxes, partial_boxes = segmenter.detect_form_boxes_categorized(bgr)
-        
-        # Process full boxes
-        crops = segmenter.crop_boxes(bgr, full_boxes)
-        for box_i, crop in enumerate(crops):
+        boxes = segmenter.detect_form_boxes(bgr)
+        crops = segmenter.crop_boxes(bgr, boxes)
+        for crop in crops:
             encoded.append(cv2.imencode(".png", crop)[1].tobytes())
-            crops_bgr.append(crop)
-            meta.append({"image_name": name, "box": box_i})
-            
-        # Crop partial boxes
-        p_crops = segmenter.crop_boxes(bgr, partial_boxes)
-        for p_crop in p_crops:
-            partial_encoded.append(cv2.imencode(".png", p_crop)[1].tobytes())
 
-    ocr_details = extract_text_detail_batch(encoded)
+    texts = extract_text_batch(encoded) if encoded else []
     
-    # Process partial boxes to extract their IDs
-    partial_ids = []
-    if partial_encoded:
-        partial_ocr_details = extract_text_detail_batch(partial_encoded)
-        for detail in partial_ocr_details:
-            text = detail["text"]
-            rec = match_record_by_number(records, text)
-            if rec:
-                rec_no = rec.get("record_no", "")
-                numeric_id = re.sub(r"\D", "", str(rec_no))
-                if numeric_id:
-                    partial_ids.append(numeric_id)
-                    continue
-            m = re.search(r'\b(61\d{3}|63\d{3})\b', text)
-            if m:
-                partial_ids.append(m.group(1))
-            else:
-                partial_ids.append("Unknown")
-
-    # ── build Excel workbook ───────────────────────────────────────────────
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "OCR Extract"
-
-    # Header: "ID" then one column per CRM field (matches CRM export order)
-    ws.append(["ID"] + [LABELS[k] for k in export_keys])
-
-    hdr_font  = Font(bold=True, color="FFFFFF", size=11)
-    hdr_fill  = PatternFill("solid", fgColor="4F46E5")
-    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for cell in ws[1]:
-        cell.font, cell.fill, cell.alignment = hdr_font, hdr_fill, hdr_align
-    ws.row_dimensions[1].height = 34
-
-    green_fill = PatternFill("solid", fgColor="DCFCE7")
-    amber_fill = PatternFill("solid", fgColor="FEF3C7")
-
-    # Data rows
-    for m, detail in zip(meta, ocr_details):
-        ocr_text    = detail["text"]
-        token_boxes = detail["token_boxes"]
-        record      = match_record_by_number(records, ocr_text)
-
-        if not record:
-            # Unmatched – blank row highlighted amber so it is easy to spot
-            ws.append([""] + [""] * len(export_keys))
-            for cell in ws[ws.max_row]:
-                cell.fill = amber_fill
-        else:
-            result    = compare_record(record, ocr_text, token_boxes, strict=False)  # extraction
-            result    = _fill_empty_found(result)
-            result    = _fill_empty_found_excel(result)
-            found_map = {f["field"]: (f.get("found") or "") for f in result["fields"]}
-
-            # Numeric ID: strip every non-digit from the record number so
-            # "L_I@63135" becomes "63135", matching the CRM export column.
-            rec_no     = record.get("record_no", "")
-            numeric_id = re.sub(r"\D", "", rec_no)
-
-            ws.append([numeric_id] + [found_map.get(k, "") for k in export_keys])
-            for cell in ws[ws.max_row]:
-                cell.fill = green_fill
-
-    # Polish: auto-width, freeze header row, enable auto-filter
-    for col in ws.columns:
-        max_len = max(
-            (len(str(cell.value)) for cell in col if cell.value is not None),
-            default=8,
-        )
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 42)
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Response(
-        content=buf.getvalue(),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f'attachment; filename="ocr_extract_{ts}.xlsx"',
-            "X-Form-Count": str(len(meta)),
-            "X-Image-Count": str(len(order)),
-            "X-Partial-Forms": ",".join(partial_ids),
-            "Access-Control-Expose-Headers": "Content-Disposition, X-Form-Count, X-Image-Count, X-Partial-Forms",
-        },
-    )
+    completed, new_pending = stitch_texts(pending, texts)
+    rows = [extract_row(t) for t in completed]
+    
+    return {
+        "header": EXTRACT_HEADER,
+        "rows": rows,
+        "count": len(rows),
+        "pending": new_pending,
+        "images": order,
+        "elapsed_seconds": round(time.time() - started, 1),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")
+    }
