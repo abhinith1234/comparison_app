@@ -1,144 +1,175 @@
-# OCR Form Validator
+# OCR Form Extractor & Validator
 
-An automated checking assistant that validates scanned insurance forms against the data entered into the CRM. It runs local OCR preprocessing on the form image, aligns CRM field entries, and highlights character-level mismatches in an interactive, downloadable validation report.
+A tool that:
+1. **Extracts** scanned insurance form images into a structured Excel spreadsheet (no CRM data needed).
+2. **Validates** scanned forms against CRM data, highlighting character-level mismatches.
 
-This project consists of:
-- **Backend**: FastAPI + PaddleOCR (open-source local OCR) + OpenCV Preprocessing + RapidFuzz
+**Stack:**
+- **Backend**: FastAPI + PaddleOCR (local, offline OCR) + OpenCV preprocessing + RapidFuzz
 - **Frontend**: React (Vite)
 
 ---
 
-## 🚀 Setup Guide for Complete Beginners
+## 📋 Prerequisites
 
-If you are new to the repository and do not have **Python** or **Node.js** installed on your system, follow the steps below for your operating system.
+| Tool | Minimum Version | Notes |
+|------|----------------|-------|
+| **Python** | 3.9 – 3.11 | 3.10 or 3.11 recommended |
+| **Node.js** | 18 LTS or newer | Includes `npm` |
+| **Git** | Any | To clone the repo |
+| **Microsoft Visual C++ Redistributable** | 2015–2022 | Windows only – required by PaddlePaddle |
 
-### 📋 Prerequisites & Installation
-
-#### 1. Install Node.js (for the Frontend)
-Node.js runs the Vite development server for the user interface.
-* **Windows**:
-  1. Download the **LTS installer** from [nodejs.org](https://nodejs.org/).
-  2. Run the `.msi` installer and follow the instructions (keep the default settings).
-* **macOS**:
-  * Install via Homebrew: `brew install node`
-  * Or download the macOS Installer from [nodejs.org](https://nodejs.org/).
-* **Linux (Debian/Ubuntu)**:
-  ```bash
-  sudo apt-get update
-  sudo apt-get install -y nodejs npm
-  ```
-
-#### 2. Install Python 3.9+ (for the Backend)
-The backend OCR and comparison engine runs on Python.
-* **Windows**:
-  1. Download the latest Python installer (3.10 or 3.11 is recommended) from [python.org](https://www.python.org/downloads/).
-  2. **CRITICAL**: Check the box that says **"Add python.exe to PATH"** before clicking *Install Now*.
-  3. Install the **Microsoft Visual C++ Redistributable** (often required by PaddlePaddle library for machine learning modules).
-* **macOS**:
-  * Install via Homebrew: `brew install python`
-* **Linux (Debian/Ubuntu)**:
-  ```bash
-  sudo apt-get update
-  sudo apt-get install -y python3 python3-pip python3-venv
-  ```
+> **GPU (optional):** If you have an NVIDIA GPU with CUDA 11.x / 12.x, PaddleOCR will automatically use it and run ~5× faster. CPU works fine out of the box.
 
 ---
 
-## 🏃 Setup & Run the Application
+## 🚀 Quick Setup
 
-### Method A: The Double-Click Launcher (Windows – Easiest)
+### Windows – Double-Click (Easiest)
 
-If you are on Windows, you can set up and start the application in a single action:
-
-1. **Double-click `run.bat`** in the project's root folder.
-2. *What it does*: 
-   * It checks for Python and Node.js. If missing, it will install them automatically using Windows `winget` (you may be asked to approve the prompt).
-   * It automatically builds the Python virtual environment (`backend/.venv`), installs dependencies, installs frontend packages, and launches both servers in separate windows.
-   * It automatically opens [http://localhost:5173](http://localhost:5173) in your web browser when ready!
-3. To stop the application, simply close the two command prompt windows labeled "OCR Backend" and "OCR Frontend".
-
----
-
-### Method B: Using the Automated Startup Script (macOS / Linux / Bash)
-
-If you have a terminal environment that supports Bash (like Git Bash on Windows, Terminal on macOS, or Linux):
-
-1. **Open your terminal** in the project's root directory (`comparison_app`).
-2. **Run the startup script**:
-   ```bash
-   bash start.sh
-   ```
-   * *What it does*: It detects your Python version, sets up the virtual environment, installs dependencies, installs frontend modules, and starts both servers.
-3. **Open the App**:
-   * **Frontend UI**: [http://localhost:5173](http://localhost:5173)
-   * **Backend API Documentation**: [http://localhost:8000/docs](http://localhost:8000/docs)
-
-To stop the servers at any time, press `Ctrl + C` in the terminal.
+1. **Double-click `run.bat`** in the project root folder.
+2. The script will:
+   - Install Python and Node.js via `winget` if missing (you may be prompted to approve).
+   - Create a Python virtual environment and install all backend dependencies.
+   - Install frontend packages with `npm install`.
+   - Start both servers and open [http://localhost:5173](http://localhost:5173) in your browser.
+3. To stop: close the two terminal windows labelled **"OCR Backend"** and **"OCR Frontend"**.
 
 ---
 
-### Method C: Manual Setup (Powershell / CMD / Custom)
+### macOS / Linux – Shell Script
 
-If you wish to run the commands step-by-step manually:
+```bash
+# From the project root
+bash start.sh
+```
 
-#### Step 1: Start the Backend
-Open a terminal in the project root directory and run:
+The script sets up the virtual environment, installs everything, and starts both servers.
+
+- **App UI**: [http://localhost:5173](http://localhost:5173)
+- **API docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+Press `Ctrl + C` to stop.
+
+---
+
+### Manual Setup (PowerShell / CMD / Any OS)
+
+#### Step 1 – Backend
+
 ```powershell
-# Navigate to backend directory
 cd backend
 
-# Create a virtual environment
+# Create and activate a virtual environment
 python -m venv .venv
 
-# Activate the virtual environment
-# On Windows PowerShell:
+# Windows PowerShell
 .venv\Scripts\Activate.ps1
-# On Windows CMD:
+# Windows CMD
 .venv\Scripts\activate.bat
-# On macOS/Linux:
+# macOS / Linux
 source .venv/bin/activate
 
-# Upgrade pip and install requirements
+# Install dependencies (includes PaddleOCR, OpenCV, FastAPI, etc.)
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Start the FastAPI server
+# Start the API server
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-#### Step 2: Start the Frontend
-Open a **new, separate terminal** in the project root directory and run:
+#### Step 2 – Frontend
+
+Open a **new separate terminal** in the project root:
+
 ```powershell
-# Navigate to frontend directory
 cd frontend
 
-# Install package dependencies
 npm install
-
-# Start the React development server
 npm run dev
 ```
-Once started, navigate to [http://localhost:5173](http://localhost:5173) in your web browser.
+
+Open [http://localhost:5173](http://localhost:5173).
 
 ---
 
-## ⚙️ How the Alignment & OCR Works
+## ⚠️ First-Run Notes
 
-1. **CRM Seeding**: Stored CRM records are located inside [records.json](file:///n:/comparison_app/comparison_app/backend/data/all_user_forms_details.json).
-2. **Preprocessing**: When a form image is uploaded, OpenCV applies grayscale conversion, upscaling, CLAHE contrast enhancement, and unsharp masking to maximize OCR accuracy.
-3. **Local Machine Learning**: `PaddleOCR` processes the image locally and reads all text characters.
-4. **Field Alignment**: CRM records are mapped to the OCR text positionally using a dynamic programming alignment algorithm.
-5. **Exact Diff Matching**: The final verdict is character-exact. If there is a single character difference (other than case/spaces), it flags a red highlight.
+- **PaddleOCR model download**: The first time the backend handles an image, PaddleOCR will automatically download its OCR model files (~150 MB). This is a one-time download and requires an internet connection.  
+- **OCR cache**: Once an image is OCR'd, results are cached locally in `backend/.ocr_cache/`. Re-uploading the same image is instant.
+- **Windows "Execution Policy" error** when running `.venv\Scripts\Activate.ps1`: Run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` in PowerShell, then try again.
 
-For details on how to review the reports, see the full [User Manual](file:///n:/comparison_app/comparison_app/USER_MANUAL.md).
+---
+
+## 🖼️ Using the Image-to-Excel Extractor
+
+1. Open the app at [http://localhost:5173](http://localhost:5173).
+2. Click **"OCR Extract to Excel"** (or the equivalent tab).
+3. Upload one or more scanned sheet images (`.jpg`, `.png`, `.bmp`, `.tif`).
+   - If you have multi-page scans, upload all pages **together** – the system sorts them by filename automatically (name them sequentially, e.g. `LifeData_001.jpg`, `LifeData_002.jpg`).
+4. Click **Extract**. A progress bar shows per-image progress.
+5. When complete, an `.xlsx` file downloads automatically.
+
+**What the extractor produces:**
+- One row per form box detected in the images.
+- All 60 CRM columns filled (Record No, Policy Holder, Nominee, Agent, Plan, Payment, etc.).
+- A **Remarks** column with validation notes (e.g. `PHONE NO. INVALID`, `ZIP INVALID`).
+- Cross-page forms (where a form box is split across two pages) are automatically stitched together.
+
+---
+
+## ✅ Using the CRM Validator
+
+1. Upload the CRM export JSON to `backend/data/all_user_forms_details 2.json` (replace existing file).
+2. In the app, select a **CRM Record** from the dropdown.
+3. Upload the matching **scanned form image**.
+4. Click **Validate** – a field-by-field comparison report downloads automatically.
+
+---
+
+## ⚙️ How It Works
+
+1. **Segmentation**: OpenCV detects and crops individual form boxes from each sheet image.
+2. **Preprocessing**: Each crop is upscaled, deskewed, CLAHE-enhanced, denoised, and sharpened before OCR.
+3. **OCR**: PaddleOCR (PP-OCRv4, offline) reads text from each crop.
+4. **Extraction (DP)**: An order-preserving dynamic-programming segmenter assigns each OCR token to one of the 60 fixed fields using per-field content scorers.
+5. **Stitching**: Forms split across page boundaries are detected and merged automatically.
+6. **Output**: Rows are written to Excel, sorted by Record ID.
 
 ---
 
 ## 🛠️ API Reference
 
-| Method | Path             | Purpose                                                |
-| ------ | ---------------- | ------------------------------------------------------ |
-| `GET`  | `/records`       | Retrieves a list of all stored CRM records             |
-| `GET`  | `/records/{key}` | Fetch specific record data by `record_no`               |
-| `POST` | `/records`       | Create or update a CRM record                          |
-| `POST` | `/validate`      | Submit `form_no` + form image to run OCR and get a diff|
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/records` | List all CRM records |
+| `GET` | `/records/{key}` | Fetch a record by `record_no` |
+| `POST` | `/records` | Create / update a CRM record |
+| `POST` | `/validate` | OCR + diff a form image against a CRM record |
+| `POST` | `/extract` | Extract form images → structured rows (used by the Excel exporter) |
+| `POST` | `/ocr` | Raw OCR of an uploaded image |
+
+Full interactive docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+---
+
+## 🗂️ Project Structure
+
+```
+comparison_app/
+├── backend/
+│   ├── main.py              # FastAPI app + all endpoints
+│   ├── image_to_excel.py    # OCR extraction pipeline (DP segmenter, stitching)
+│   ├── field_patterns.py    # Per-field scorers + canonicalisation rules
+│   ├── fields.py            # Field definitions (60 columns, order, labels)
+│   ├── segmenter.py         # Form-box detection (OpenCV)
+│   ├── ocr_engine.py        # PaddleOCR wrapper + image preprocessing
+│   ├── comparator.py        # CRM vs OCR field comparison
+│   ├── requirements.txt     # Python dependencies
+│   └── data/                # CRM export JSON lives here
+└── frontend/
+    ├── src/
+    │   ├── App.jsx          # Main UI (extractor + validator)
+    │   └── styles.css
+    └── package.json
+```
