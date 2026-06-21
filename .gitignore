@@ -69,5 +69,4 @@ untitled folder/
 *.xlsx
 *.zip
 *.pdf
-backend/data/*.json
 !backend/data/.gitkeep
