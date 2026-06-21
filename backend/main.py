@@ -697,25 +697,37 @@ async def extract_forms(
 
     encoded: list[bytes] = []
     order: list[str] = []
+    image_crop_counts: list[int] = []
 
     for up in images:
         name = up.filename or f"image_{len(order)}"
         order.append(name)
         raw = await up.read()
         if not raw:
+            image_crop_counts.append(0)
             continue
         bgr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
         if bgr is None:
+            image_crop_counts.append(0)
             continue
         
         boxes = segmenter.detect_form_boxes(bgr)
         crops = segmenter.crop_boxes(bgr, boxes)
+        image_crop_counts.append(len(crops))
         for crop in crops:
             encoded.append(cv2.imencode(".png", crop)[1].tobytes())
 
     texts = extract_text_batch(encoded) if encoded else []
     
-    completed, new_pending = stitch_texts(pending, texts)
+    completed = []
+    new_pending = pending
+    idx = 0
+    for count in image_crop_counts:
+        img_texts = texts[idx : idx + count]
+        c, new_pending = stitch_texts(new_pending, img_texts)
+        completed.extend(c)
+        idx += count
+        
     rows = [extract_row(t) for t in completed]
     
     return {

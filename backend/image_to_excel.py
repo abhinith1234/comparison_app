@@ -173,35 +173,54 @@ def pure_extract(tokens) -> dict:
 
 def extract_row(text: str) -> list:
     """Build one output row (ID + all columns) from a form's OCR text."""
+    # 3. No Extra Spaces & 4. Avoid Double Space
     tokens = re.sub(r"\s+", " ", text).strip().split()
     values = pure_extract(tokens)
     rid = record_id(text) or ""
     row = [rid]
+    
+    remarks = []
+    
+    # Pre-process all values
+    for key, label in OUTPUT_FIELDS:
+        val = values.get(key, "").strip()
+        
+        # 6. No Inverted Commas
+        val = re.sub(r"['\"‘’“”]", "", val)
+        
+        if ON_FORM.get(key):
+            # 5. Missing / Not Applicable Data
+            if not val or val.replace(".", "").strip().upper() in ("NA", "N/A"):
+                val = "N.A. (AS PER IMAGE)"
+                remarks.append(f"{label.upper()} NOT GIVEN")
+            else:
+                # 1. Phone Number
+                if "phone" in key.lower():
+                    digits = re.sub(r"\D", "", val)
+                    if len(digits) < 10:
+                        remarks.append("PHONE NO. INVALID")
+                
+                # 2. ZIP Code
+                if "zip" in key.lower():
+                    digits = re.sub(r"\D", "", val)
+                    if len(digits) < 5:
+                        remarks.append("ZIP INVALID")
+        
+        values[key] = val
+
     for key, _ in OUTPUT_FIELDS:
         if key == "record_no":
-            # The record number always prints as "L_I@<id>"; OCR sometimes drops
-            # the "L_" prefix, so rebuild it from the numeric id when we have one.
             row.append(f"L_I@{rid}" if rid else (values.get("record_no") or ""))
         elif key == "total_amount":
             row.append(_total_amount(values.get("premium", ""), values.get("discount", "")))
-        elif key in OFF_FORM_BLANK or not ON_FORM[key]:
+        elif key == "remark":
+            row.append(", ".join(remarks))
+        elif key in OFF_FORM_BLANK or not ON_FORM.get(key):
             row.append("")
         else:
             row.append(values.get(key, ""))
+            
     return row
-
-
-def stitch_texts(pending: list[str], texts: list[str], cols: int = 2) -> tuple[list[str], list[str]]:
-    """Stitch the pending partials from the previous page to the top of the new page,
-    and hold back the bottom partials of the new page for the next chunk."""
-    texts = list(texts)
-    n_stitch = min(len(pending), len(texts))
-    for i in range(n_stitch):
-        texts[i] = (pending[i] + " " + texts[i]).strip()
-
-    if len(texts) > cols:
-        return texts[:-cols], texts[-cols:]
-    return [], texts
 
 
 def gather_images(paths) -> list:
