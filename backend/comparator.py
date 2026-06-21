@@ -84,16 +84,30 @@ def compare_key(value: str) -> str:
     return key.translate(_AMBIGUOUS)
 
 
-def _align(expected_strs, expected_lens, tokens):
+def _align(expected_strs, expected_lens, tokens, strict: bool = True):
     """Order-preserving DP alignment of expected values to OCR tokens.
 
     Fuzzy similarity is used here only to find each field's span.
     Returns a (start, end) span into `tokens` for each field.
+
+    strict=True  (validation path)
+        Tighter search window (target_len + 2) and a higher recovery threshold
+        (55) so the aligner does not over-reach and produce false matches that
+        would wrongly pass a validation check.
+
+    strict=False  (extraction / OCR-to-Excel path)
+        Wider search window (target_len + 4) and a lower recovery threshold for
+        short single-token values like Yes/No (40) so every question field gets
+        its answer even when many consecutive identical tokens appear in a row.
     """
     n = len(expected_strs)
     m = len(tokens)
     if n == 0:
         return []
+
+    # Per-mode tuning
+    extra_window  = 2 if strict else 4   # tokens beyond target_len to search
+    recovery_base = 55                    # minimum score for the recovery pass
 
     def window_score(idx, start, end):
         return fuzz.ratio(expected_strs[idx], collapse(" ".join(tokens[start:end])))
@@ -103,7 +117,8 @@ def _align(expected_strs, expected_lens, tokens):
     dp[0] = [0.0] * (m + 1)
 
     for i in range(1, n + 1):
-        target_len = max(1, expected_lens[i - 1])
+        target_len    = max(1, expected_lens[i - 1])
+        search_window = target_len + extra_window
         pref_val = [NEG] * (m + 1)
         pref_arg = [0] * (m + 1)
         run, run_arg = NEG, 0
@@ -113,7 +128,7 @@ def _align(expected_strs, expected_lens, tokens):
             pref_val[j], pref_arg[j] = run, run_arg
 
         for j in range(m + 1):
-            for length in range(0, target_len + 2):
+            for length in range(0, search_window + 1):
                 start = j - length
                 if start < 0:
                     continue
@@ -169,7 +184,14 @@ def _align(expected_strs, expected_lens, tokens):
                 )
                 if sc > best_score:
                     best_score, best_span = sc, (start, end)
-        if best_span and best_score >= 55:
+        # Extraction mode lowers the threshold for single-token values (Yes/No)
+        # because their maximum possible fuzz score is inherently lower when
+        # they compete with longer surrounding context.
+        if strict:
+            min_score = recovery_base
+        else:
+            min_score = 40 if target <= 1 else recovery_base
+        if best_span and best_score >= min_score:
             spans[i] = best_span
             for t in range(best_span[0], best_span[1]):
                 occupied[t] = True
@@ -187,7 +209,17 @@ def _union_box(boxes):
     ]
 
 
-def compare_record(record: dict, ocr_text: str, token_boxes=None) -> dict:
+def compare_record(record: dict, ocr_text: str, token_boxes=None, strict: bool = True) -> dict:
+    """Compare a stored CRM record against OCR text from the scanned form.
+
+    strict=True  (default) – used by the validation endpoints (/validate,
+        /validate-batch).  Tight alignment so a near-miss never passes.
+
+    strict=False – used by the OCR-to-Excel extraction endpoint.
+        Wider alignment window + lower recovery threshold so every field
+        (especially Policy Holder address fields and Yes/No questions) gets
+        its value even when many consecutive identical tokens appear.
+    """
     tokens = collapse(ocr_text).split()
     # Same tokens but with original letter case preserved (collapse() upper-cases
     # for robust alignment; the verdict and display must keep the real case).
@@ -201,7 +233,7 @@ def compare_record(record: dict, ocr_text: str, token_boxes=None) -> dict:
     ]
     expected_strs = [collapse(record.get(key, "")) for key in align_keys]
     expected_lens = [len(s.split()) for s in expected_strs]
-    spans = _align(expected_strs, expected_lens, tokens)
+    spans = _align(expected_strs, expected_lens, tokens, strict=strict)
     span_by_key = {align_keys[i]: spans[i] for i in range(len(align_keys))}
 
     field_results = []

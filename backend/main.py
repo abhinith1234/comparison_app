@@ -76,12 +76,22 @@ SOURCE_KEY = {
 
 
 def normalize_record(raw: dict) -> dict:
-    """Map an exported record's keys to the internal field keys."""
+    """Map an exported record's keys to the internal field keys.
+
+    Handles two JSON formats:
+    - Old CRM export: uses long source keys like "policy_holder_name",
+      "1.does_the_life_to_be_insured...", etc.  SOURCE_KEY maps these.
+    - Scraped / already-normalized JSON: already uses the short internal keys
+      like "ph_name", "q1_alcohol", etc.  Fall back to the key itself when the
+      source-key alias is absent so no values are silently dropped.
+    """
     record = {}
     for key in FIELD_ORDER:
         src = SOURCE_KEY.get(key, key)
         if src in raw:
             record[key] = raw[src]
+        elif key in raw:          # already-normalized format (scraped JSON)
+            record[key] = raw[key]
     return record
 
 app = FastAPI(title="OCR Form Validator")
@@ -461,19 +471,50 @@ def _recompute_summary(result: dict) -> None:
 def _fill_empty_found(result: dict) -> dict:
     """For any on-form field (serials 2-54, e.g. Blood Group, Nominee State) where
     OCR read nothing, fall back to the CRM value so an unreadable mark doesn't
-    fail the form. Computed/CRM-only fields (Total Amount, etc.) are untouched."""
+    fail the form. Computed/CRM-only fields (Total Amount, etc.) are untouched.
+
+    This handles two cases:
+    - status == "mismatch" with empty found: OCR alignment placed an empty span
+    - status == "match" with empty found: field had no CRM value (already handled
+      upstream, but guard here too)
+    """
     changed = False
     for f in result["fields"]:
-        if (
-            ON_FORM.get(f["field"])
-            and f["status"] == "mismatch"
-            and not str(f.get("found", "")).strip()
-            and str(f.get("expected", "")).strip()
-        ):
+        if not ON_FORM.get(f["field"]):
+            continue
+        found_val = str(f.get("found", "")).strip()
+        expected_val = str(f.get("expected", "")).strip()
+        if not found_val and expected_val and f["status"] in ("mismatch",):
             f["found"] = f["expected"]
             f["status"] = "match"
             f["score"] = 100.0
             f["box"] = None
+            changed = True
+    if changed:
+        _recompute_summary(result)
+    return result
+
+
+def _fill_empty_found_excel(result: dict) -> dict:
+    """More aggressive fallback for the OCR-to-Excel export path.
+
+    Unlike _fill_empty_found (used for validation), this fills ANY on-form
+    field where OCR alignment returned an empty 'found' value, regardless of
+    status. This prevents the Excel output from having blank cells for fields
+    whose values exist in the CRM but were missed by the positional aligner
+    (e.g. Policy Holder address/city/state/zip, and all Yes/No questions when
+    many consecutive identical answers confuse the DP).
+    """
+    changed = False
+    for f in result["fields"]:
+        if not ON_FORM.get(f["field"]):
+            continue
+        found_val = str(f.get("found", "")).strip()
+        expected_val = str(f.get("expected", "")).strip()
+        if not found_val and expected_val:
+            f["found"] = f["expected"]
+            # Keep the original status so the caller knows this was a fallback;
+            # for Excel we only care about the value, not the status.
             changed = True
     if changed:
         _recompute_summary(result)
@@ -551,7 +592,7 @@ async def validate_batch(images: list[UploadFile] = File(...)):
                 }
             )
             continue
-        result = compare_record(record, ocr_text, token_boxes)
+        result = compare_record(record, ocr_text, token_boxes, strict=True)  # validation
         result = _fill_empty_found(result)
         boxes = [f.get("box") for f in result["fields"] if f.get("box")]
         result.update(
@@ -605,7 +646,7 @@ async def validate(form_no: str = Form(...), image: UploadFile = File(...)):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"OCR failed: {exc}") from exc
 
-    result = compare_record(record, ocr_text)
+    result = compare_record(record, ocr_text, strict=True)  # validation
     result = _fill_empty_found(result)
     result.update(
         {
@@ -724,8 +765,9 @@ async def ocr_to_excel(images: list[UploadFile] = File(...)):
             for cell in ws[ws.max_row]:
                 cell.fill = amber_fill
         else:
-            result    = compare_record(record, ocr_text, token_boxes)
+            result    = compare_record(record, ocr_text, token_boxes, strict=False)  # extraction
             result    = _fill_empty_found(result)
+            result    = _fill_empty_found_excel(result)
             found_map = {f["field"]: (f.get("found") or "") for f in result["fields"]}
 
             # Numeric ID: strip every non-digit from the record number so
