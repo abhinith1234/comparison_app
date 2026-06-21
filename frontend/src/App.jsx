@@ -748,7 +748,24 @@ function OcrToExcelMode() {
 
       // Generate Excel using xlsx package
       if (!header) header = ["ID"];
-      const ws = XLSX.utils.aoa_to_sheet([header, ...allRows]);
+      // Convert numeric ID column (index 0) to an actual number so Excel
+      // doesn't treat it as text (which causes the leading ' apostrophe) or
+      // apply a thousands separator (61501 → 61,501).
+      const sheetData = [header, ...allRows.map(row => {
+        const r = [...row];
+        const num = Number(r[0]);
+        if (!isNaN(num) && String(r[0]).trim() !== "") r[0] = num;
+        return r;
+      })];
+      const ws = XLSX.utils.aoa_to_sheet(sheetData);
+      // Apply a plain integer format (no comma separator) to the ID column
+      const idColRange = XLSX.utils.decode_range(ws['!ref'] || 'A1');
+      for (let R = 1; R <= idColRange.e.r; R++) {
+        const cellAddr = XLSX.utils.encode_cell({ r: R, c: 0 });
+        if (ws[cellAddr] && ws[cellAddr].t === 'n') {
+          ws[cellAddr].z = '0'; // plain integer, no comma
+        }
+      }
       
       // Basic styling: auto-width approximations
       const colWidths = header.map((h, i) => {

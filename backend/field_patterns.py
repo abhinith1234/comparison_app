@@ -132,10 +132,12 @@ def _s_state(tokens):
     # not split. Anything else scores very low so it can't masquerade as a state.
     if len(tokens) != 1:
         return 3.0
-    up = tokens[0].upper().strip(".,")
-    if up in _vocab("agent_state") or up in _vocab("ph_state") or up in _vocab("nominee_state"):
+    # Strip leading non-alpha junk (e.g. OCR '<' artifact before 'NY')
+    cleaned = re.sub(r'^[^A-Za-z]+', '', tokens[0]).upper().strip(".,")
+    if cleaned in _vocab("agent_state") or cleaned in _vocab("ph_state") or cleaned in _vocab("nominee_state"):
         return 100.0
-    return 80.0 if re.fullmatch(r"[A-Za-z]{2}", up) else 3.0
+    # Accept clean 2-letter alpha codes only; reject long words like city names
+    return 80.0 if re.fullmatch(r"[A-Za-z]{2}", cleaned) else 3.0
 
 
 def _s_zip(tokens):
@@ -354,6 +356,14 @@ def canonicalize(key, value):
     if key in PERIOD_FIELDS:
         m = re.search(r"\d+", v)
         return f"{m.group(0)} Year" if m else v
+    if key == "invoice_no":
+        v = re.sub(r'^[L_I]*@\d{4,6}\s*', '', v, flags=re.IGNORECASE)
+        return v
+    if key in ("ph_state", "nominee_state", "agent_state"):
+        # Strip leading non-alpha OCR junk (e.g. '<NY' -> 'NY')
+        cleaned = re.sub(r'^[^A-Za-z]+', '', v).strip()
+        # If the result is a clean 2-letter code, return it; otherwise keep original
+        return cleaned if re.fullmatch(r'[A-Za-z]{2}', cleaned) else v
     if key in PREFIX_FIELDS:
         digits = re.sub(r"\D", "", v)
         return f"{PREFIX_FIELDS[key]}-{digits}" if len(digits) >= 6 else v
