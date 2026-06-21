@@ -112,12 +112,19 @@ def _s_city(tokens):
     return 42 + 20 * _alpha_ratio(tokens)
 
 
+ADDR_START_KW = {"PO", "P.O.", "P.O", "BOX", "POBOX", "P.O.BOX", "STE", "SUITE",
+                 "APT", "UNIT", "ATTN"}
+
+
 def _s_address(tokens):
     if not tokens:
         return 0.0
     up = [t.upper().strip(",.") for t in tokens]
     score = 40.0
-    if HAS_DIGIT.search(tokens[0]):  # most addresses begin with a house number
+    # An address starts like one if it begins with a house number OR a PO-box /
+    # suite keyword (so "P.O. Box 82533" reads as the address, not bleeding its
+    # "P.O. Box" prefix back into the agent_name before it).
+    if HAS_DIGIT.search(tokens[0]) or up[0] in ADDR_START_KW:
         score += 28
     if any(t in STREET_KW for t in up):
         score += 22
@@ -180,7 +187,20 @@ def _s_blood(tokens):
 
 
 def _s_policy(tokens):
-    return 95.0 if len(tokens) == 1 and POLICY.match(tokens[0]) else 6.0
+    # OCR frequently splits "P-649337582299351" into "P-" + "649337582299351";
+    # joining up to two tokens lets the policy number be captured whole instead
+    # of leaking its digits into the following reference_no column.
+    if not tokens or len(tokens) > 2:
+        return 6.0
+    joined = "".join(tokens).upper().replace(" ", "")
+    if POLICY.match(joined):
+        return 95.0
+    # OCR sometimes drops the leading "P", leaving a bare 14-16 digit run. At the
+    # policy position that is the policy number (canonicalize re-adds the "P-"),
+    # so claim it here instead of letting it strand in the blood_group column.
+    if re.fullmatch(r"\d{14,16}", joined):
+        return 90.0
+    return 6.0
 
 
 def _s_card_no(tokens):
@@ -188,7 +208,15 @@ def _s_card_no(tokens):
 
 
 def _s_code16(tokens):
-    return 82.0 if len(tokens) == 1 and CODE16.match(tokens[0]) else 18.0
+    if len(tokens) != 1 or not CODE16.match(tokens[0]):
+        return 18.0
+    t = tokens[0]
+    # Real reference/agent/transaction codes are mixed alphanumerics. An all-digit
+    # (or all-alpha) run is almost always a policy/card number that OCR split off,
+    # so score it low here to stop it being stolen from policy_no/card_no.
+    if any(c.isalpha() for c in t) and any(c.isdigit() for c in t):
+        return 88.0
+    return 25.0
 
 
 def _s_record(tokens):
@@ -257,7 +285,21 @@ def _s_card_type(tokens):
 
 def _s_agent_name(tokens):
     sc = _best_vocab_score(" ".join(tokens), "agent_name")
-    return max(sc * 0.95, 42 + 18 * _alpha_ratio(tokens))
+    base = max(sc * 0.95, 42 + 18 * _alpha_ratio(tokens))
+    # Agent/company names never contain house or route numbers, so a window that
+    # swallows a digit token is really reaching into agent_address; penalise it.
+    digit_tokens = sum(bool(HAS_DIGIT.search(t)) for t in tokens)
+    base -= 30 * digit_tokens
+    # Nor do they end in a street/PO-box keyword ("...Company P.O. Box"); peel
+    # those trailing tokens back so they land in agent_address instead.
+    up = [t.upper().strip(".,") for t in tokens]
+    trailing = 0
+    for t in reversed(up):
+        if t in STREET_KW or t in ADDR_START_KW:
+            trailing += 1
+        else:
+            break
+    return base - 20 * trailing
 
 
 # key -> (min_len, max_len, ideal_len, scorer)
@@ -286,7 +328,7 @@ SPEC = {
     "height": (1, 1, 1, _s_int(140, 210)),
     "weight": (1, 1, 1, _s_int(80, 220)),
     "blood_group": (1, 2, 1, _s_blood),
-    "policy_no": (1, 1, 1, _s_policy),
+    "policy_no": (1, 2, 1, _s_policy),
     "reference_no": (1, 1, 1, _s_code16),
     "agent_name": (1, 12, 3, _s_agent_name),
     "agent_address": (1, 8, 3, _s_address),

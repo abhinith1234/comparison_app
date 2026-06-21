@@ -107,10 +107,32 @@ trap cleanup SIGINT SIGTERM
 start_backend() {
     log "Starting backend on $BACKEND_URL …"
     cd "$BACKEND"
-    uvicorn main:app --reload --host 0.0.0.0 --port "$BACKEND_PORT" &
+    if [[ "$OSTYPE" == darwin* ]]; then
+        # macOS: PaddleOCR's ThreadPoolExecutor causes a segfault on arm64.
+        # Force serial OCR execution and disable the reload watcher.
+        OCR_SERIAL=1 uvicorn main:app --host 0.0.0.0 --port "$BACKEND_PORT" &
+    else
+        # Keep reload for non-mac dev flows, but do not watch the virtualenv.
+        uvicorn main:app --reload --reload-exclude '.venv/**' --host 0.0.0.0 --port "$BACKEND_PORT" &
+    fi
     BACKEND_PID=$!
     ok "Backend PID $BACKEND_PID"
     cd "$ROOT"
+}
+
+wait_for_backend() {
+    local attempts=300
+    local i
+    log "Waiting for backend health check at $BACKEND_URL/health …"
+    for ((i = 1; i <= attempts; i++)); do
+        if curl -fsS "$BACKEND_URL/health" >/dev/null 2>&1; then
+            ok "Backend is ready."
+            return 0
+        fi
+        sleep 1
+    done
+    err "Backend did not become ready within ${attempts}s."
+    exit 1
 }
 
 # ── start frontend ─────────────────────────────────────────────────────────
@@ -174,7 +196,7 @@ case "$MODE" in
     *)
         setup_venv "$REINSTALL"
         start_backend
-        sleep 2      # give uvicorn a moment before the frontend proxy connects
+        wait_for_backend
         start_frontend
         ;;
 esac
