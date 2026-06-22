@@ -14,7 +14,7 @@ if %errorlevel% equ 0 (
     git pull
 ) else (
     if exist "C:\Program Files\Git\cmd\git.exe" (
-        echo [SYSTEM] Checking for updates from repository (using absolute Git path)...
+        echo [SYSTEM] Checking for updates from repository ^(using absolute Git path^)...
         "C:\Program Files\Git\cmd\git.exe" pull
     ) else (
         echo [WARNING] Git not found in PATH or standard location. Skipping auto-update.
@@ -86,7 +86,7 @@ echo.
 
 :: Setup frontend
 if not exist "frontend\node_modules" (
-    echo [SYSTEM] Installing frontend package dependencies (this may take a minute)...
+    echo [SYSTEM] Installing frontend package dependencies ^(this may take a minute^)...
     cd frontend
     call npm install
     cd ..
