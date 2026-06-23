@@ -546,6 +546,107 @@ def _encode_crop(crop: np.ndarray, boxes: list) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
 
 
+def _group_forms(ocr_details: list, meta: list) -> list:
+    """Group crops into whole forms, rejoining a record split across pages: a
+    top-partial (record marker but clipped/incomplete) waits for its bottom
+    continuation in the SAME column; complete forms stand alone. Returns lists of
+    crop indices (each list = one form, in top->bottom order)."""
+    from image_to_excel import _is_form_start, _is_complete
+
+    pending: list = []  # [[member_indices], col]
+    groups: list = []
+    for i, d in enumerate(ocr_details):
+        toks = d["text"].split()
+        col = meta[i].get("col", 0.5)
+        if not toks:
+            groups.append([i])
+        elif _is_form_start(toks):
+            if _is_complete(toks):
+                groups.append([i])
+            else:
+                pending.append([[i], col])
+        elif pending:  # bottom-half -> nearest open top-partial by column
+            j = min(range(len(pending)), key=lambda k: abs(pending[k][1] - col))
+            members = pending.pop(j)[0]
+            members.append(i)
+            groups.append(members)
+        else:
+            groups.append([i])  # orphan bottom-half -> its own (will be unmatched)
+    for members, _ in pending:  # top-partials that never got a continuation
+        groups.append(members)
+    return groups
+
+
+def _validate_form_group(members, ocr_details, crops_bgr, meta, records):
+    """Validate one form (one or more crops). For a multi-crop (split) form the
+    OCR text is merged before matching/comparison, and each crop is returned in
+    `sources` annotated only with the field boxes that fall on it. Returns
+    (home_image_name, result)."""
+    merged_text = " ".join(ocr_details[m]["text"] for m in members)
+    merged_boxes: list = []
+    offsets: list = []
+    running = 0
+    for m in members:
+        offsets.append(running)
+        merged_boxes.extend(ocr_details[m]["token_boxes"])
+        running += len(ocr_details[m]["text"].split())
+
+    def member_of(tok_start):
+        if tok_start is None:
+            return 0
+        k = 0
+        for idx, off in enumerate(offsets):
+            if tok_start >= off:
+                k = idx
+        return k
+
+    src_meta = [
+        {"image_name": meta[m]["image_name"], "box": meta[m]["box"]} for m in members
+    ]
+    home = meta[members[-1]]["image_name"]  # the crop that completed it (this batch)
+
+    record = match_record_by_number(records, merged_text)
+    if not record:
+        sources = [
+            {**src_meta[k], "image": _encode_crop(crops_bgr[members[k]], [])}
+            for k in range(len(members))
+        ]
+        return home, {
+            "image_name": home,
+            "box": meta[members[-1]]["box"],
+            "sources": sources,
+            "image": sources[0]["image"],
+            "matched": False,
+            "record_no": None,
+            "ocr_text": merged_text,
+            "message": "No matching record found for this form",
+        }
+
+    result = compare_record(record, merged_text, merged_boxes)
+    per_member: list = [[] for _ in members]
+    for f in result["fields"]:
+        if f.get("box"):
+            per_member[member_of(f.get("tok_start"))].append(f["box"])
+    sources = [
+        {**src_meta[k], "image": _encode_crop(crops_bgr[members[k]], per_member[k])}
+        for k in range(len(members))
+    ]
+    result.update(
+        {
+            "image_name": home,
+            "box": meta[members[-1]]["box"],
+            "sources": sources,
+            "image": sources[0]["image"],
+            "matched": True,
+            "record_no": record.get("record_no"),
+            "form_no": record.get("form_no"),
+            "ph_name": record.get("ph_name"),
+            "ocr_text": merged_text,
+        }
+    )
+    return home, result
+
+
 @app.post("/validate-batch")
 async def validate_batch(images: list[UploadFile] = File(...)):
     started = time.time()
@@ -553,7 +654,7 @@ async def validate_batch(images: list[UploadFile] = File(...)):
 
     # Detect & crop every form box across ALL uploaded images first, then OCR the
     # whole pile in one parallel pass (one box = one OCR job). `meta` keeps each
-    # crop tied back to its source image and position.
+    # crop tied back to its source image, position and column (for stitching).
     encoded: list[bytes] = []
     crops_bgr: list[np.ndarray] = []
     meta: list[dict] = []
@@ -570,61 +671,38 @@ async def validate_batch(images: list[UploadFile] = File(...)):
         if bgr is None:
             image_errors[name] = "Could not decode image"
             continue
-        crops = segmenter.crop_boxes(bgr, segmenter.detect_form_boxes(bgr))
-        for box_i, crop in enumerate(crops):
+        W = bgr.shape[1] or 1
+        boxes = segmenter.detect_form_boxes(bgr)
+        crops = segmenter.crop_boxes(bgr, boxes)
+        for box_i, (crop, (x, y, w, h)) in enumerate(zip(crops, boxes)):
             encoded.append(cv2.imencode(".png", crop)[1].tobytes())
             crops_bgr.append(crop)
-            meta.append({"image_name": name, "box": box_i})
+            meta.append({"image_name": name, "box": box_i, "col": (x + w / 2) / W})
 
     ocr_details = extract_text_detail_batch(encoded)
 
+    # Rejoin records split across pages, then validate each whole form. A merged
+    # form is filed under the image of the crop that completed it (this batch).
     by_image: dict[str, list] = {name: [] for name in order}
-    for idx, (m, detail) in enumerate(zip(meta, ocr_details)):
-        ocr_text = detail["text"]
-        token_boxes = detail["token_boxes"]
-        crop = crops_bgr[idx]
-        record = match_record_by_number(records, ocr_text)
-        if not record:
-            by_image[m["image_name"]].append(
-                {
-                    **m,
-                    "image": _encode_crop(crop, []),
-                    "matched": False,
-                    "record_no": None,
-                    "ocr_text": ocr_text,
-                    "message": "No matching record found for this form",
-                }
-            )
-            continue
-        result = compare_record(record, ocr_text, token_boxes)  # validation
-        # No fill_empty_found: ocr_missed and mismatch must stay visible.
-        boxes = [f.get("box") for f in result["fields"] if f.get("box")]
-        result.update(
-            {
-                **m,
-                "image": _encode_crop(crop, boxes),
-                "matched": True,
-                "record_no": record.get("record_no"),
-                "form_no": record.get("form_no"),
-                "ph_name": record.get("ph_name"),
-                "ocr_text": ocr_text,
-            }
+    for members in _group_forms(ocr_details, meta):
+        home, result = _validate_form_group(
+            members, ocr_details, crops_bgr, meta, records
         )
-        by_image[m["image_name"]].append(result)
+        by_image.setdefault(home, []).append(result)
 
     images_out = [
         {
             "image_name": name,
             "error": image_errors.get(name),
-            "forms_detected": len(by_image[name]),
-            "results": by_image[name],
+            "forms_detected": len(by_image.get(name, [])),
+            "results": by_image.get(name, []),
         }
         for name in order
     ]
 
     return {
         "image_count": len(order),
-        "forms_detected": sum(len(by_image[n]) for n in order),
+        "forms_detected": sum(len(v) for v in by_image.values()),
         "images": images_out,
         "elapsed_seconds": round(time.time() - started, 1),
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

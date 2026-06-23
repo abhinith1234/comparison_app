@@ -247,7 +247,28 @@ function reportBody(result) {
       <tbody>${rows}</tbody>
     </table>
     ${
-      result.image
+      result.sources?.length
+        ? `<div class="formimg"><h3>Form image${
+            result.sources.length > 1 ? "s" : ""
+          }</h3>${
+            s.mismatched
+              ? '<p style="color:#b91c1c;font-weight:600;margin:4px 0">Red boxes mark the values that did not match.</p>'
+              : ""
+          }${result.sources
+            .map(
+              (src, i) =>
+                `${
+                  result.sources.length > 1
+                    ? `<p style="margin:6px 0 2px;font-weight:600">Part ${
+                        i + 1
+                      } of ${result.sources.length} · ${escapeHtml(
+                        src.image_name || ""
+                      )}</p>`
+                    : ""
+                }<img src="${src.image}"/>`
+            )
+            .join("")}</div>`
+        : result.image
         ? `<div class="formimg"><h3>Form image</h3>${
             s.mismatched
               ? '<p style="color:#b91c1c;font-weight:600;margin:4px 0">Red boxes mark the values that did not match.</p>'

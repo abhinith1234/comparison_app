@@ -751,6 +751,22 @@ td.expected-missed {
   font-weight: 700;
   font-size: 11px;
 }
+.batch-span {
+  color: var(--muted);
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.form-crop-wrap {
+  margin-bottom: 10px;
+}
+.crop-source {
+  color: var(--muted);
+  font-weight: 600;
+  margin: 6px 0 2px;
+}
 .batch-counts {
   font-variant-numeric: tabular-nums;
   font-size: 13px;

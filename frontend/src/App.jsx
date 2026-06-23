@@ -525,10 +525,15 @@ function BatchFormCard({ form, overrides, setOverrides }) {
         <div className="batch-row">
           <span className="batch-box">Form #{form.box + 1}</span>
           <span className="batch-norec">No matching record found</span>
-          {form.image && (
+          {(form.sources?.[0]?.image || form.image) && (
             <button
               className="link-btn"
-              onClick={() => openImage(form.image, `form ${form.box + 1}`)}
+              onClick={() =>
+                openImage(
+                  form.sources?.[0]?.image || form.image,
+                  `form ${form.box + 1}`
+                )
+              }
             >
               View image
             </button>
@@ -558,6 +563,11 @@ function BatchFormCard({ form, overrides, setOverrides }) {
         <span className="batch-box">Form #{form.box + 1}</span>
         <span className="batch-rec">{eff.record_no}</span>
         <span className="batch-name">{eff.ph_name}</span>
+        {form.sources?.length > 1 && (
+          <span className="batch-span" title={form.sources.map((s) => s.image_name).join(" + ")}>
+            spans {form.sources.length} pages
+          </span>
+        )}
         {eff.image_mismatch && <span className="batch-warn">wrong image?</span>}
         <span className="batch-counts">
           {eff.summary.matched}/{eff.summary.checked}
@@ -580,14 +590,31 @@ function BatchFormCard({ form, overrides, setOverrides }) {
       </div>
       {open && (
         <div className="batch-detail">
-          {form.image && (
+          {(form.sources?.length
+            ? form.sources
+            : form.image
+            ? [{ image: form.image, image_name: form.image_name }]
+            : []
+          ).length > 0 && (
             <>
               {eff.summary.mismatched > 0 && (
                 <p className="crop-caption">
                   Red boxes mark the values that didn't match.
                 </p>
               )}
-              <img className="form-crop" src={form.image} alt="form crop" />
+              {(form.sources?.length
+                ? form.sources
+                : [{ image: form.image, image_name: form.image_name }]
+              ).map((s, idx) => (
+                <div key={idx} className="form-crop-wrap">
+                  {form.sources?.length > 1 && (
+                    <p className="crop-caption crop-source">
+                      Part {idx + 1} of {form.sources.length} · {s.image_name}
+                    </p>
+                  )}
+                  <img className="form-crop" src={s.image} alt="form crop" />
+                </div>
+              ))}
             </>
           )}
           <div className="actions">
