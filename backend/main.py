@@ -666,13 +666,7 @@ async def validate(form_no: str = Form(...), image: UploadFile = File(...)):
     return result
 
 
-from image_to_excel import (
-    HEADER as EXTRACT_HEADER,
-    extract_row_from_cells,
-    extract_cells,
-    stitch_cells,
-    recover_blood_in_text,
-)
+from image_to_excel import HEADER as EXTRACT_HEADER, extract_row, stitch_texts
 
 
 @app.post("/extract")
@@ -690,7 +684,7 @@ async def extract_forms(
     flush_bool = str(flush).lower() == "true"
 
     if flush_bool or not images:
-        rows = [extract_row_from_cells(c) for c in pending]
+        rows = [extract_row(t) for t in pending]
         return {
             "header": EXTRACT_HEADER,
             "rows": rows,
@@ -702,7 +696,6 @@ async def extract_forms(
         }
 
     encoded: list[bytes] = []
-    crops_bgr: list[np.ndarray] = []
     order: list[str] = []
     image_crop_counts: list[int] = []
 
@@ -723,27 +716,19 @@ async def extract_forms(
         image_crop_counts.append(len(crops))
         for crop in crops:
             encoded.append(cv2.imencode(".png", crop)[1].tobytes())
-            crops_bgr.append(crop)
 
-    # Detail OCR (with per-word boxes) so a dropped blood-group +/- sign can be
-    # recovered and so each crop's words can be grouped into underline cells (one
-    # underline = one column value) before segmentation.
-    details = extract_text_detail_batch(encoded) if encoded else []
-    cell_lists = []
-    for i, d in enumerate(details):
-        text = recover_blood_in_text(d["text"], d["token_boxes"], crops_bgr[i])
-        cell_lists.append(extract_cells(crops_bgr[i], text.split(), d["token_boxes"]))
-
+    texts = extract_text_batch(encoded) if encoded else []
+    
     completed = []
     new_pending = pending
     idx = 0
     for count in image_crop_counts:
-        chunk = cell_lists[idx : idx + count]
-        c, new_pending = stitch_cells(new_pending, chunk)
+        img_texts = texts[idx : idx + count]
+        c, new_pending = stitch_texts(new_pending, img_texts)
         completed.extend(c)
         idx += count
-
-    rows = [extract_row_from_cells(c) for c in completed]
+        
+    rows = [extract_row(t) for t in completed]
     
     return {
         "header": EXTRACT_HEADER,

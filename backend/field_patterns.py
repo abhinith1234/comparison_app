@@ -36,23 +36,6 @@ CODE16 = re.compile(r"^[A-Za-z0-9]{13,18}$")
 CODE_SHORT = re.compile(r"^[A-Za-z0-9]{5,9}$")
 BLOOD = re.compile(r"^(AB|A|B|O|0)\s?[+\-]$")
 BLOOD_LETTERS = {"A", "B", "AB", "O", "0"}
-# Characters OCR commonly produces in place of the +/- sign after a blood group:
-# '+' gets read as t/T/4 (or split into its own token), '-' as a dash/underscore.
-_BLOOD_PLUS_LIKE = set("+T4")
-_BLOOD_MINUS_LIKE = set("-—–~_")
-_BLOOD_SIGN_LIKE = _BLOOD_PLUS_LIKE | _BLOOD_MINUS_LIKE
-
-# US state / territory 2-letter codes — used only as a guidance anchor so a clean
-# state reading locks hard during segmentation. Unknown 2-letter codes still pass
-# (see _s_state) so non-US / unseen states are handled too.
-US_STATES = {
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
-    "DC", "PR", "GU", "VI", "AS", "MP",
-}
 ALPHA_WORD = re.compile(r"^[A-Za-z][A-Za-z.'\-]*$")
 HAS_DIGIT = re.compile(r"\d")
 STREET_KW = {
@@ -158,15 +141,9 @@ def _s_state(tokens):
         return 3.0
     # Strip leading non-alpha junk (e.g. OCR '<' artifact before 'NY')
     cleaned = re.sub(r'^[^A-Za-z]+', '', tokens[0]).upper().strip(".,")
-    # A known US state code, or a value learned from the CRM export, is a hard
-    # anchor so the city before it is not split.
-    if (cleaned in US_STATES
-            or cleaned in _vocab("agent_state")
-            or cleaned in _vocab("ph_state")
-            or cleaned in _vocab("nominee_state")):
+    if cleaned in _vocab("agent_state") or cleaned in _vocab("ph_state") or cleaned in _vocab("nominee_state"):
         return 100.0
-    # Any other clean 2-letter alpha code still passes (handles non-US / unseen
-    # states); reject long words like city names.
+    # Accept clean 2-letter alpha codes only; reject long words like city names
     return 80.0 if re.fullmatch(r"[A-Za-z]{2}", cleaned) else 3.0
 
 
@@ -201,16 +178,9 @@ def _s_blood(tokens):
     # group itself, so it can't swallow the Policy No "P-..." that follows.
     if not tokens or len(tokens) > 2:
         return 4.0
-    joined = "".join(tokens).upper().replace(" ", "").replace("0", "O")
+    joined = "".join(tokens).upper().replace(" ", "")
     if BLOOD.match(joined):  # full group, sign possibly split into its own token
         return 98.0
-    # Letter + a 1-char sign that OCR mangled (e.g. '+' -> 't'/'4', '-' -> '—').
-    # Claim it so the sign is kept instead of dropped or leaked into policy_no.
-    if len(tokens) == 2:
-        letter = tokens[0].upper().replace("0", "O")
-        sign = tokens[1].upper()
-        if letter in BLOOD_LETTERS and len(sign) == 1 and sign in _BLOOD_SIGN_LIKE:
-            return 92.0
     if len(tokens) == 1 and joined.rstrip("+-") in BLOOD_LETTERS:  # sign lost by OCR
         return 75.0
     return 5.0
@@ -411,26 +381,6 @@ PERIOD_FIELDS = {"period_of_insurance"}
 PREFIX_FIELDS = {"policy_no": "P", "card_no": "C"}
 
 
-def _canon_blood(value):
-    """Recover the blood group +/- sign when OCR garbled or split it.
-
-    The letter is always one of A/B/AB/O; anything trailing it is the sign, which
-    OCR may render as a look-alike (t/4 for '+', a dash/underscore for '-') or as
-    a separate token. If no sign is present at all we keep just the letter (we
-    can't invent it); extract_row flags that case in the Remark column.
-    """
-    s = re.sub(r"\s+", "", value).upper().replace("0", "O")
-    m = re.match(r"^(AB|A|B|O)(.*)$", s)
-    if not m:
-        return value
-    letter, rest = m.group(1), m.group(2)
-    if any(c in _BLOOD_PLUS_LIKE for c in rest):
-        return letter + "+"
-    if any(c in _BLOOD_MINUS_LIKE for c in rest):
-        return letter + "-"
-    return letter
-
-
 def canonicalize(key, value):
     """Normalise a raw OCR value to the field's canonical form/format."""
     if not value:
@@ -438,8 +388,6 @@ def canonicalize(key, value):
     v = value.strip()
     if "?" in v:
         return v
-    if key == "blood_group":
-        return _canon_blood(v)
     if key in CANON_ENUM:
         opts = CANON_ENUM[key]
         best = max(opts, key=lambda o: fuzz.ratio(v.upper(), o.upper()))
