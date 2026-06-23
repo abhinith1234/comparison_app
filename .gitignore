@@ -31,7 +31,7 @@ coverage.xml
 *,cover
 .hypothesis/
 .pytest_cache/
-
+.ocr_cache/
 # Node / JS
 node_modules/
 frontend/node_modules/

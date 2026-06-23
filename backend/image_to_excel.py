@@ -144,6 +144,47 @@ def stitch_texts(seed_pending, texts):
     return completed, pending
 
 
+def _norm_pending(seed_pending):
+    """Accept pending entries as [text, col] (new) or bare text (legacy carry)."""
+    out = []
+    for p in seed_pending:
+        if isinstance(p, str):
+            out.append([p, 0.5])
+        else:
+            out.append([p[0], (p[1] if len(p) > 1 and p[1] is not None else 0.5)])
+    return out
+
+
+def stitch_texts_by_column(seed_pending, items):
+    """Merge form halves split across pages, matching each bottom-half to the
+    open top-partial in the SAME COLUMN (closest x-center) instead of by FIFO
+    order. `items` is a list of [text, col] where col is the crop's x-center as a
+    fraction of page width (0..1); the returned pending uses the same shape.
+
+    This keeps left->left and right->right correct even when the two pages are
+    read in a different left/right order, or a continuation is missing on one
+    side (the unmatched top-partial simply stays open instead of mis-pairing)."""
+    pending = _norm_pending(seed_pending)
+    completed = []
+    for text, col in items:
+        tokens = text.split()
+        if not tokens:
+            continue
+        if _is_form_start(tokens):
+            if _is_complete(tokens):
+                completed.append(text)
+            else:
+                pending.append([text, col])
+        elif pending:
+            col = col if col is not None else 0.5
+            j = min(range(len(pending)), key=lambda k: abs(pending[k][1] - col))
+            top_text, _ = pending.pop(j)
+            completed.append(top_text + " " + text)
+        else:
+            completed.append(text)  # orphan bottom-half -> its own row
+    return completed, pending
+
+
 def _detect_underlines(crop):
     """Return underline segment boxes [(x0, y0, x1, y1)] found on the crop.
 

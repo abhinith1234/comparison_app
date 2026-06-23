@@ -666,7 +666,11 @@ async def validate(form_no: str = Form(...), image: UploadFile = File(...)):
     return result
 
 
-from image_to_excel import HEADER as EXTRACT_HEADER, extract_row, stitch_texts
+from image_to_excel import (
+    HEADER as EXTRACT_HEADER,
+    extract_row,
+    stitch_texts_by_column,
+)
 
 
 @app.post("/extract")
@@ -684,7 +688,7 @@ async def extract_forms(
     flush_bool = str(flush).lower() == "true"
 
     if flush_bool or not images:
-        rows = [extract_row(t) for t in pending]
+        rows = [extract_row(p[0] if not isinstance(p, str) else p) for p in pending]
         return {
             "header": EXTRACT_HEADER,
             "rows": rows,
@@ -696,6 +700,7 @@ async def extract_forms(
         }
 
     encoded: list[bytes] = []
+    cols: list[float] = []  # each crop's x-center as a fraction of page width
     order: list[str] = []
     image_crop_counts: list[int] = []
 
@@ -710,24 +715,26 @@ async def extract_forms(
         if bgr is None:
             image_crop_counts.append(0)
             continue
-        
+
+        W = bgr.shape[1] or 1
         boxes = segmenter.detect_form_boxes(bgr)
         crops = segmenter.crop_boxes(bgr, boxes)
         image_crop_counts.append(len(crops))
-        for crop in crops:
+        for crop, (x, y, w, h) in zip(crops, boxes):
             encoded.append(cv2.imencode(".png", crop)[1].tobytes())
+            cols.append((x + w / 2) / W)
 
     texts = extract_text_batch(encoded) if encoded else []
-    
+
     completed = []
     new_pending = pending
     idx = 0
     for count in image_crop_counts:
-        img_texts = texts[idx : idx + count]
-        c, new_pending = stitch_texts(new_pending, img_texts)
+        items = list(zip(texts[idx : idx + count], cols[idx : idx + count]))
+        c, new_pending = stitch_texts_by_column(new_pending, items)
         completed.extend(c)
         idx += count
-        
+
     rows = [extract_row(t) for t in completed]
     
     return {
