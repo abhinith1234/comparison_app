@@ -82,3 +82,6 @@ untitled folder/
 148/
 149/
 150/
+backend/data/scraped_*.json
+**/scraped_*.json
+

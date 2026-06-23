@@ -36,6 +36,162 @@ function fileToDataUrl(file) {
 
 const API = "/api";
 
+const IMG_RE = /\.(jpe?g|png|bmp|tiff?)$/i;
+
+// Relative path used for grouping: the browser sets webkitRelativePath for
+// folder picks; dropped folders get it stamped on by the traversal below.
+function relPathOf(f) {
+  return f.webkitRelativePath || f._relPath || f.name;
+}
+
+// Group selected files by the folder that directly contains them. Files with no
+// folder path (loose files / flat selection) fall into one "Selected files"
+// group; everything else groups by its containing folder.
+function groupByFolder(files) {
+  const groups = new Map();
+  for (const f of files) {
+    const rel = relPathOf(f);
+    const parts = rel.split("/");
+    const dir = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
+    const key = dir || "(files)";
+    const label = dir ? parts[parts.length - 2] : "Selected files";
+    if (!groups.has(key)) groups.set(key, { key, label, files: [] });
+    groups.get(key).files.push(f);
+  }
+  const arr = [...groups.values()];
+  const byName = (a, b) =>
+    a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+  arr.forEach((g) => g.files.sort((a, b) => byName(a.name, b.name)));
+  arr.sort((a, b) => byName(a.label, b.label));
+  return arr;
+}
+
+function stampRelPath(file, path) {
+  try {
+    Object.defineProperty(file, "webkitRelativePath", {
+      value: path,
+      configurable: true,
+    });
+  } catch {
+    file._relPath = path; // fallback if the property can't be overridden
+  }
+  return file;
+}
+
+function readEntries(reader) {
+  return new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+}
+
+// Recursively collect image File objects from a dropped FileSystemEntry, tagging
+// each with its relative path (so multiple dropped folders stay separable).
+async function traverseEntry(entry, prefix, out) {
+  if (!entry) return;
+  if (entry.isFile) {
+    const file = await new Promise((res, rej) => entry.file(res, rej));
+    if (IMG_RE.test(file.name)) out.push(stampRelPath(file, prefix + file.name));
+  } else if (entry.isDirectory) {
+    const reader = entry.createReader();
+    let batch;
+    do {
+      batch = await readEntries(reader);
+      for (const child of batch) {
+        await traverseEntry(child, prefix + entry.name + "/", out);
+      }
+    } while (batch.length);
+  }
+}
+
+// A unified upload area: drag & drop one or more folders (or images), or click
+// to browse files / a single folder. Grouping is detected automatically.
+function DropZone({ files, onFiles, idPrefix }) {
+  const [drag, setDrag] = useState(false);
+
+  async function handleDrop(e) {
+    e.preventDefault();
+    setDrag(false);
+    const items = e.dataTransfer?.items ? Array.from(e.dataTransfer.items) : [];
+    const entries = items
+      .map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null))
+      .filter(Boolean);
+    let collected = [];
+    if (entries.length) {
+      for (const entry of entries) await traverseEntry(entry, "", collected);
+    } else {
+      collected = Array.from(e.dataTransfer.files || []).filter((f) =>
+        IMG_RE.test(f.name)
+      );
+    }
+    if (collected.length) onFiles(collected);
+  }
+
+  function pickFiles(e) {
+    onFiles(Array.from(e.target.files || []).filter((f) => IMG_RE.test(f.name)));
+  }
+
+  const groups = files.length ? groupByFolder(files) : [];
+  const folderCount = groups.filter((g) => g.key !== "(files)").length;
+  const looseCount = groups
+    .filter((g) => g.key === "(files)")
+    .reduce((a, g) => a + g.files.length, 0);
+  let summary = "";
+  if (files.length) {
+    if (folderCount === 0) summary = `${files.length} image(s) — no folders`;
+    else {
+      summary = `${files.length} image(s) across ${folderCount} folder(s)`;
+      if (looseCount) summary += ` (+ ${looseCount} loose)`;
+    }
+  }
+
+  return (
+    <div
+      className={`dropzone ${drag ? "drag" : ""}`}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDrag(true);
+      }}
+      onDragLeave={() => setDrag(false)}
+      onDrop={handleDrop}
+    >
+      <div className="dropzone-icon">📁</div>
+      <p className="dropzone-text">Drag &amp; drop folders or images here</p>
+      <p className="dropzone-sub">
+        Multiple folders supported — each folder is processed and downloaded
+        separately.
+      </p>
+      <div className="dropzone-actions">
+        <label className="dropzone-browse" htmlFor={`${idPrefix}-files`}>
+          Browse files
+        </label>
+        <label className="dropzone-browse" htmlFor={`${idPrefix}-folder`}>
+          Browse a folder
+        </label>
+      </div>
+      <input
+        id={`${idPrefix}-files`}
+        type="file"
+        accept="image/*"
+        multiple
+        hidden
+        onChange={pickFiles}
+      />
+      <input
+        id={`${idPrefix}-folder`}
+        type="file"
+        multiple
+        hidden
+        ref={(el) => {
+          if (el) {
+            el.setAttribute("webkitdirectory", "");
+            el.setAttribute("directory", "");
+          }
+        }}
+        onChange={pickFiles}
+      />
+      {summary && <p className="dropzone-summary">{summary}</p>}
+    </div>
+  );
+}
+
 const STATUS_META = {
   match: { label: "Match", cls: "st-match" },
   partial: { label: "Partial", cls: "st-partial" },
@@ -457,16 +613,50 @@ function BatchFormCard({ form, overrides, setOverrides }) {
 // each response small and lets us show progress.
 const BATCH_CHUNK = 4;
 
+// Run the chunked validate-batch pipeline for one folder's images. Each form box
+// in each image is detected, matched to its record, and validated independently.
+async function validateFolder(folderFiles, onProgress) {
+  const images = [];
+  let elapsed = 0;
+
+  for (let i = 0; i < folderFiles.length; i += BATCH_CHUNK) {
+    const group = folderFiles.slice(i, i + BATCH_CHUNK);
+    const body = new FormData();
+    group.forEach((f) => body.append("images", f));
+    const res = await fetch(`${API}/validate-batch`, { method: "POST", body });
+    const text = await res.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      if (!res.ok) throw new Error(`Validation failed (${res.status})`);
+      throw new Error(
+        "Server returned an incomplete response. Try fewer images at once."
+      );
+    }
+    if (!res.ok) throw new Error(json.detail || "Batch validation failed");
+    images.push(...json.images);
+    elapsed += json.elapsed_seconds || 0;
+    onProgress?.(Math.min(i + BATCH_CHUNK, folderFiles.length));
+  }
+
+  return {
+    images,
+    elapsed: Math.round(elapsed * 10) / 10,
+    forms_detected: images.reduce((a, im) => a + (im.forms_detected || 0), 0),
+  };
+}
+
 function BatchMode() {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(null);
   const [error, setError] = useState("");
-  const [data, setData] = useState(null);
+  const [data, setData] = useState(null); // { folders: [...], generated_at }
   const [overridesByForm, setOverridesByForm] = useState({});
   const [filter, setFilter] = useState("all"); // all | matched | unmatched
 
-  const formKey = (imName, box) => `${imName}-${box}`;
+  const formKey = (folderKey, imName, box) => `${folderKey}::${imName}-${box}`;
   const makeSetOverrides = (key) => (updater) =>
     setOverridesByForm((all) => {
       const cur = all[key] || {};
@@ -474,10 +664,11 @@ function BatchMode() {
       return { ...all, [key]: next };
     });
 
-  function onFiles(e) {
-    setFiles(Array.from(e.target.files || []));
+  function handleFiles(list) {
+    setFiles(list);
     setData(null);
     setOverridesByForm({});
+    setError("");
   }
 
   async function onRun(e) {
@@ -486,41 +677,21 @@ function BatchMode() {
     setData(null);
     if (!files.length) return setError("Upload one or more images.");
     setLoading(true);
-    setData(null);
     try {
-      const images = [];
-      let elapsed = 0;
-      for (let i = 0; i < files.length; i += BATCH_CHUNK) {
-        const group = files.slice(i, i + BATCH_CHUNK);
-        setProgress({ done: i, total: files.length });
-        const body = new FormData();
-        group.forEach((f) => body.append("images", f));
-        const res = await fetch(`${API}/validate-batch`, {
-          method: "POST",
-          body,
-        });
-        const text = await res.text();
-        let json;
-        try {
-          json = JSON.parse(text);
-        } catch {
-          if (!res.ok) throw new Error(`Validation failed (${res.status})`);
-          throw new Error(
-            "Server returned an incomplete response. Try fewer images at once."
-          );
-        }
-        if (!res.ok) throw new Error(json.detail || "Batch validation failed");
-        images.push(...json.images);
-        elapsed += json.elapsed_seconds || 0;
-        setProgress({ done: Math.min(i + BATCH_CHUNK, files.length), total: files.length });
+      const groups = groupByFolder(files);
+      const folders = [];
+      let processed = 0;
+      for (const g of groups) {
+        const { images, elapsed, forms_detected } = await validateFolder(
+          g.files,
+          (doneInFolder) =>
+            setProgress({ done: processed + doneInFolder, total: files.length })
+        );
+        processed += g.files.length;
+        setProgress({ done: processed, total: files.length });
+        folders.push({ key: g.key, label: g.label, images, elapsed, forms_detected });
       }
-      setData({
-        image_count: images.length,
-        forms_detected: images.reduce((a, im) => a + (im.forms_detected || 0), 0),
-        images,
-        elapsed_seconds: Math.round(elapsed * 10) / 10,
-        generated_at: new Date().toISOString(),
-      });
+      setData({ folders, generated_at: new Date().toISOString() });
       setOverridesByForm({});
     } catch (err) {
       setError(err.message);
@@ -530,24 +701,28 @@ function BatchMode() {
     }
   }
 
-  const allResults = data?.images.flatMap((im) => im.results) || [];
+  const folders = data?.folders || [];
+  const allResults = folders.flatMap((fd) => fd.images.flatMap((im) => im.results));
   const matched = allResults.filter((r) => r.matched);
   const unmatchedCount = allResults.length - matched.length;
   const passed = matched.filter((r) => r.verdict === "PASS").length;
+  const totalForms = folders.reduce((a, fd) => a + (fd.forms_detected || 0), 0);
+  const totalImages = folders.reduce((a, fd) => a + fd.images.length, 0);
+  const multiFolder = folders.length > 1;
 
   const passFilter = (f) =>
     filter === "all" ? true : filter === "matched" ? f.matched : !f.matched;
 
-  // Reports for the currently shown (filtered) forms. Empty / unmapped forms are
-  // included too (with their image and OCR text), so "Download all" really is all.
-  const shownReports = () => {
+  // Reports for the shown (filtered) forms of one folder. Empty / unmapped forms
+  // are included too (with their image + OCR text) so the download is complete.
+  const folderReports = (fd) => {
     const out = [];
-    (data?.images || []).forEach((im) =>
+    fd.images.forEach((im) =>
       im.results.forEach((f) => {
         if (!passFilter(f)) return;
         out.push(
           f.matched
-            ? applyOverrides(f, overridesByForm[formKey(im.image_name, f.box)])
+            ? applyOverrides(f, overridesByForm[formKey(fd.key, im.image_name, f.box)])
             : f
         );
       })
@@ -560,11 +735,8 @@ function BatchMode() {
       <section className="card">
         <h2>Validate multi-form sheets</h2>
         <form onSubmit={onRun}>
-          <label>Sheet image(s) — you can select several</label>
-          <input type="file" accept="image/*" multiple onChange={onFiles} />
-          {files.length > 0 && (
-            <p className="hint">{files.length} image(s) selected.</p>
-          )}
+          <label>Sheet images — drop one or more folders, or pick files</label>
+          <DropZone files={files} onFiles={handleFiles} idPrefix="batch" />
           <button type="submit" disabled={loading}>
             {loading ? "Reading forms…" : "Validate all forms"}
           </button>
@@ -576,8 +748,8 @@ function BatchMode() {
           {error && <p className="error">{error}</p>}
         </form>
         <p className="hint">
-          Every form in every image is detected and matched to its record
-          automatically by the record number printed on it.
+          Every form is detected and matched to its record automatically by the
+          record number printed on it.
         </p>
       </section>
 
@@ -590,24 +762,13 @@ function BatchMode() {
             <div className="result-head">
               <div>
                 <h2>
-                  {data.forms_detected} form(s) in {data.image_count} image(s)
+                  {totalForms} form(s) in {totalImages} image(s)
+                  {multiFolder && ` · ${folders.length} folder(s)`}
                 </h2>
                 <p className="sub">
                   {matched.length} matched · {passed} passed
-                  {data.elapsed_seconds != null &&
-                    ` · ran in ${data.elapsed_seconds}s`}
                 </p>
               </div>
-              {allResults.length > 0 && (
-                <button
-                  className="primary"
-                  onClick={() => downloadAllReports(shownReports())}
-                >
-                  {filter === "all"
-                    ? "Download all reports (PDF)"
-                    : `Download ${shownReports().length} shown (PDF)`}
-                </button>
-              )}
             </div>
             <div className="batch-filter">
               <button
@@ -629,31 +790,58 @@ function BatchMode() {
                 Empty / not mapped ({unmatchedCount})
               </button>
             </div>
-            {data.images.map((im) => {
-              const shown = im.results.filter(passFilter);
-              if (!shown.length) return null;
+
+            {folders.map((fd) => {
+              const reports = folderReports(fd);
               return (
-                <div key={im.image_name} className="batch-image-group">
-                  <h3 className="batch-image-title">
-                    {im.image_name}
-                    <span className="batch-image-meta">
-                      {im.error ? im.error : `${shown.length} form(s)`}
-                    </span>
-                  </h3>
-                  <div className="batch-list">
-                    {shown.map((f) => (
-                      <BatchFormCard
-                        key={formKey(im.image_name, f.box)}
-                        form={f}
-                        overrides={
-                          overridesByForm[formKey(im.image_name, f.box)] || {}
-                        }
-                        setOverrides={makeSetOverrides(
-                          formKey(im.image_name, f.box)
-                        )}
-                      />
-                    ))}
+                <div key={fd.key} className="folder-section">
+                  <div className="folder-head">
+                    <h3 className="folder-title">
+                      📁 {fd.label}
+                      <span className="folder-meta">
+                        {fd.forms_detected} form(s) · {fd.images.length} image(s)
+                        {fd.elapsed != null && ` · ${fd.elapsed}s`}
+                      </span>
+                    </h3>
+                    {reports.length > 0 && (
+                      <button
+                        className="primary"
+                        onClick={() => downloadAllReports(reports)}
+                      >
+                        ↓ Download {fd.label} reports (PDF)
+                      </button>
+                    )}
                   </div>
+                  {fd.images.map((im) => {
+                    const shown = im.results.filter(passFilter);
+                    if (!shown.length) return null;
+                    return (
+                      <div key={im.image_name} className="batch-image-group">
+                        <h4 className="batch-image-title">
+                          {im.image_name}
+                          <span className="batch-image-meta">
+                            {im.error ? im.error : `${shown.length} form(s)`}
+                          </span>
+                        </h4>
+                        <div className="batch-list">
+                          {shown.map((f) => (
+                            <BatchFormCard
+                              key={formKey(fd.key, im.image_name, f.box)}
+                              form={f}
+                              overrides={
+                                overridesByForm[
+                                  formKey(fd.key, im.image_name, f.box)
+                                ] || {}
+                              }
+                              setOverrides={makeSetOverrides(
+                                formKey(fd.key, im.image_name, f.box)
+                              )}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               );
             })}
@@ -664,12 +852,97 @@ function BatchMode() {
   );
 }
 
+// Run the chunked /extract pipeline for one folder's images, carrying open
+// cross-page partials (`pending`) between chunks and across a final flush.
+async function extractFolder(folderFiles, onProgress) {
+  let pending = [];
+  let rows = [];
+  let header = null;
+  let elapsed = 0;
+
+  for (let i = 0; i < folderFiles.length; i += BATCH_CHUNK) {
+    const group = folderFiles.slice(i, i + BATCH_CHUNK);
+    const body = new FormData();
+    group.forEach((f) => body.append("images", f));
+    body.append("carry", JSON.stringify(pending));
+    body.append("flush", "false");
+    const res = await fetch(`${API}/extract`, { method: "POST", body });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.detail || `Server error ${res.status}`);
+    }
+    const json = await res.json();
+    if (!header && json.header) header = json.header;
+    if (json.rows) rows.push(...json.rows);
+    pending = json.pending || [];
+    elapsed += json.elapsed_seconds || 0;
+    onProgress?.(Math.min(i + BATCH_CHUNK, folderFiles.length));
+  }
+
+  if (pending.length > 0) {
+    const body = new FormData();
+    body.append("carry", JSON.stringify(pending));
+    body.append("flush", "true");
+    const res = await fetch(`${API}/extract`, { method: "POST", body });
+    if (res.ok) {
+      const json = await res.json();
+      if (!header && json.header) header = json.header;
+      if (json.rows) rows.push(...json.rows);
+      elapsed += json.elapsed_seconds || 0;
+    }
+  }
+
+  return { header: header || ["ID"], rows, elapsed: Math.round(elapsed * 10) / 10 };
+}
+
+// Build one worksheet from a header + rows, with a numeric (comma-free) ID
+// column and auto-width columns.
+function buildExcelSheet(header, rows) {
+  const sheetData = [
+    header,
+    ...rows.map((row) => {
+      const r = [...row];
+      const num = Number(r[0]);
+      if (!isNaN(num) && String(r[0]).trim() !== "") r[0] = num;
+      return r;
+    }),
+  ];
+  const ws = XLSX.utils.aoa_to_sheet(sheetData);
+  const range = XLSX.utils.decode_range(ws["!ref"] || "A1");
+  for (let R = 1; R <= range.e.r; R++) {
+    const addr = XLSX.utils.encode_cell({ r: R, c: 0 });
+    if (ws[addr] && ws[addr].t === "n") ws[addr].z = "0";
+  }
+  ws["!cols"] = header.map((h, i) => {
+    let max = String(h).length;
+    for (const row of rows) {
+      const val = row[i] != null ? String(row[i]) : "";
+      if (val.length > max) max = val.length;
+    }
+    return { wch: Math.min(max + 2, 42) };
+  });
+  return ws;
+}
+
+// Excel sheet names: <=31 chars, no : \ / ? * [ ], non-blank, unique.
+function uniqueSheetName(label, used) {
+  let name = String(label).replace(/[\\/?*[\]:]/g, " ").trim().slice(0, 31) || "Sheet";
+  const base = name;
+  let n = 2;
+  while (used.has(name.toLowerCase())) {
+    const suffix = ` (${n++})`;
+    name = base.slice(0, 31 - suffix.length) + suffix;
+  }
+  used.add(name.toLowerCase());
+  return name;
+}
+
 function OcrToExcelMode() {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [progress, setProgress] = useState(null);
-  const [done, setDone] = useState(null); // { filename, formCount, imageCount, url, partialForms }
+  const [done, setDone] = useState(null); // { filename, formCount, imageCount, url, folders, partialForms }
 
   // Clean up Blob URLs to prevent memory leaks when done changes or unmounts
   useEffect(() => {
@@ -680,13 +953,11 @@ function OcrToExcelMode() {
     };
   }, [done]);
 
-  function onFiles(e) {
+  function handleFiles(list) {
     if (done && done.url) {
       URL.revokeObjectURL(done.url);
     }
-    const selected = Array.from(e.target.files || []);
-    selected.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
-    setFiles(selected);
+    setFiles(list);
     setDone(null);
     setError("");
   }
@@ -703,90 +974,46 @@ function OcrToExcelMode() {
     setProgress({ done: 0, total: files.length });
 
     try {
-      let pending = [];
-      let allRows = [];
-      let header = null;
-      let totalElapsed = 0;
-      let imageCount = files.length;
-
-      for (let i = 0; i < files.length; i += BATCH_CHUNK) {
-        const group = files.slice(i, i + BATCH_CHUNK);
-        setProgress({ done: i, total: files.length });
-        
-        const body = new FormData();
-        group.forEach((f) => body.append("images", f));
-        body.append("carry", JSON.stringify(pending));
-        body.append("flush", "false");
-
-        const res = await fetch(`${API}/extract`, { method: "POST", body });
-        if (!res.ok) {
-          const data = await res.json().catch(() => ({}));
-          throw new Error(data.detail || `Server error ${res.status}`);
-        }
-        
-        const json = await res.json();
-        if (!header && json.header) header = json.header;
-        if (json.rows) allRows.push(...json.rows);
-        pending = json.pending || [];
-        totalElapsed += json.elapsed_seconds || 0;
-        
-        setProgress({ done: Math.min(i + BATCH_CHUNK, files.length), total: files.length });
-      }
-
-      // Final flush if there are any pending partials
-      if (pending.length > 0) {
-        const body = new FormData();
-        body.append("carry", JSON.stringify(pending));
-        body.append("flush", "true");
-        const res = await fetch(`${API}/extract`, { method: "POST", body });
-        if (res.ok) {
-           const json = await res.json();
-           if (json.rows) allRows.push(...json.rows);
-           totalElapsed += json.elapsed_seconds || 0;
-        }
-      }
-
-      // Generate Excel using xlsx package
-      if (!header) header = ["ID"];
-      // Convert numeric ID column (index 0) to an actual number so Excel
-      // doesn't treat it as text (which causes the leading ' apostrophe) or
-      // apply a thousands separator (61501 → 61,501).
-      const sheetData = [header, ...allRows.map(row => {
-        const r = [...row];
-        const num = Number(r[0]);
-        if (!isNaN(num) && String(r[0]).trim() !== "") r[0] = num;
-        return r;
-      })];
-      const ws = XLSX.utils.aoa_to_sheet(sheetData);
-      // Apply a plain integer format (no comma separator) to the ID column
-      const idColRange = XLSX.utils.decode_range(ws['!ref'] || 'A1');
-      for (let R = 1; R <= idColRange.e.r; R++) {
-        const cellAddr = XLSX.utils.encode_cell({ r: R, c: 0 });
-        if (ws[cellAddr] && ws[cellAddr].t === 'n') {
-          ws[cellAddr].z = '0'; // plain integer, no comma
-        }
-      }
-      
-      // Basic styling: auto-width approximations
-      const colWidths = header.map((h, i) => {
-        let max = h.length;
-        for (let row of allRows) {
-          const val = row[i] != null ? String(row[i]) : "";
-          if (val.length > max) max = val.length;
-        }
-        return { wch: Math.min(max + 2, 42) };
-      });
-      ws['!cols'] = colWidths;
-      
+      const groups = groupByFolder(files);
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "OCR Extract");
-      
+      const usedNames = new Set();
+      const folderSummaries = [];
+      let processed = 0;
+      let totalElapsed = 0;
+      let totalForms = 0;
+
+      for (const g of groups) {
+        const { header, rows, elapsed } = await extractFolder(g.files, (n) =>
+          setProgress({ done: processed + n, total: files.length })
+        );
+        processed += g.files.length;
+        setProgress({ done: processed, total: files.length });
+        totalElapsed += elapsed;
+        totalForms += rows.length;
+
+        const sheet =
+          groups.length > 1
+            ? uniqueSheetName(g.label, usedNames)
+            : "OCR Extract";
+        XLSX.utils.book_append_sheet(wb, buildExcelSheet(header, rows), sheet);
+        folderSummaries.push({
+          label: g.label,
+          sheet,
+          formCount: rows.length,
+          imageCount: g.files.length,
+        });
+      }
+
+      if (!wb.SheetNames.length) {
+        XLSX.utils.book_append_sheet(wb, buildExcelSheet(["ID"], []), "OCR Extract");
+      }
+
       const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
       const blob = new Blob([wbout], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
 
       const ts = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
       const filename = `ocr_extract_${ts}.xlsx`;
-      
+
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -797,10 +1024,11 @@ function OcrToExcelMode() {
 
       setDone({
         filename,
-        formCount: allRows.length,
-        imageCount,
+        formCount: totalForms,
+        imageCount: files.length,
         url,
         elapsed: Math.round(totalElapsed * 10) / 10,
+        folders: folderSummaries,
         partialForms: []
       });
     } catch (err) {
@@ -816,11 +1044,8 @@ function OcrToExcelMode() {
       <section className="card">
         <h2>OCR → Excel</h2>
         <form onSubmit={onRun}>
-          <label>Form image(s) — select one or more scanned sheets</label>
-          <input type="file" accept="image/*" multiple onChange={onFiles} />
-          {files.length > 0 && (
-            <p className="hint">{files.length} image(s) selected.</p>
-          )}
+          <label>Scanned sheets — drop one or more folders, or pick files</label>
+          <DropZone files={files} onFiles={handleFiles} idPrefix="ocr-excel" />
           <button type="submit" disabled={loading} id="ocr-excel-submit">
             {loading ? "Extracting…" : "⬇ Extract & Download Excel"}
           </button>
@@ -828,8 +1053,8 @@ function OcrToExcelMode() {
         </form>
         <p className="hint">
           Each detected form box is OCR-read and written as one row. Columns
-          match the full CRM field order (Record No → Card Holder Name). Green
-          rows = record matched; amber rows = record not found.
+          match the full CRM field order (Record No → Card Holder Name). Upload
+          multiple folders and each becomes its own sheet in the workbook.
         </p>
       </section>
 
@@ -870,6 +1095,23 @@ function OcrToExcelMode() {
             <a href={done.url} download={done.filename} className="btn-excel-download">
               📥 Download Excel Again
             </a>
+            {done.folders && done.folders.length > 1 && (
+              <div className="excel-folder-summary">
+                <div className="excel-folder-summary-title">
+                  {done.folders.length} sheet(s) in this workbook
+                </div>
+                <ul className="excel-folder-list">
+                  {done.folders.map((fd) => (
+                    <li key={fd.sheet}>
+                      <span className="excel-folder-name">📁 {fd.label}</span>
+                      <span className="excel-folder-meta">
+                        → “{fd.sheet}” · {fd.formCount} form(s) · {fd.imageCount} image(s)
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <p className="hint" style={{ marginTop: "12px" }}>
               Check your downloads folder. Run again to refresh with new images.
             </p>

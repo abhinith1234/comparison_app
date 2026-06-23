@@ -38,7 +38,19 @@ import ocr_engine
 import segmenter
 from comparator import _total_amount
 from fields import FIELDS, FIELD_ORDER, ON_FORM
-from field_patterns import LOCATABLE, SPEC, field_score, canonicalize, CODE16, CARD
+from field_patterns import (
+    LOCATABLE,
+    SPEC,
+    field_score,
+    canonicalize,
+    CODE16,
+    CARD,
+    BLOOD_LETTERS,
+)
+
+# A policy-number-shaped token (anchors the blood group, which sits right before
+# it). OCR may keep the "P-" prefix, drop it, or read it as bare digits.
+_BLOOD_POLICY_RE = re.compile(r"^[Pp]?[-\s]?\d{12,17}$")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CRM = os.path.join(HERE, "data", "all_user_forms_details 2.json")
@@ -132,6 +144,93 @@ def stitch_texts(seed_pending, texts):
     return completed, pending
 
 
+def _detect_underlines(crop):
+    """Return underline segment boxes [(x0, y0, x1, y1)] found on the crop.
+
+    Each field value on the form sits on its own underline, so these segments are
+    the real per-column delimiters. We isolate thin, wide horizontal runs (the
+    underlines) while ignoring taller glyph strokes."""
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return []
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    h, w = th.shape
+    kw = max(15, w // 40)
+    horiz = cv2.morphologyEx(
+        th, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+    )
+    cnts, _ = cv2.findContours(horiz, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    max_h = max(4, h // 80)  # underlines are only a few pixels tall
+    segs = []
+    for c in cnts:
+        x, y, ww, hh = cv2.boundingRect(c)
+        if ww >= kw and hh <= max_h:
+            segs.append((x, y, x + ww, y + hh))
+    return segs
+
+
+def extract_cells(crop, words, boxes):
+    """Group OCR words into underline cells: one underline segment = one column
+    value. Words are bucketed into the underline directly beneath them; a word
+    with no underline becomes its own singleton cell. Returns an ordered list of
+    cell strings (reading order). Falls back to one-word-per-cell if boxes don't
+    line up or no underlines are found, so segmentation degrades gracefully."""
+    if not words:
+        return []
+    if len(words) != len(boxes):
+        return list(words)
+    segs = _detect_underlines(crop)
+    if not segs:
+        return list(words)
+
+    seg_of = [None] * len(words)
+    for wi, (bx0, by0, bx1, by1) in enumerate(boxes):
+        wh = max(1.0, by1 - by0)
+        best, best_gap = None, None
+        for si, (sx0, sy0, sx1, sy1) in enumerate(segs):
+            gap = sy0 - by1                       # underline below the word
+            if gap < -0.3 * wh or gap > 1.2 * wh:  # must sit just under the text
+                continue
+            if min(bx1, sx1) - max(bx0, sx0) <= 0:  # need horizontal overlap
+                continue
+            if best_gap is None or abs(gap) < best_gap:
+                best, best_gap = si, abs(gap)
+        seg_of[wi] = best
+
+    cells, cur_words, cur_seg = [], [], object()
+    for wi, w in enumerate(words):
+        seg = seg_of[wi]
+        if seg is not None and seg == cur_seg:
+            cur_words.append(w)
+        else:
+            if cur_words:
+                cells.append(" ".join(cur_words))
+            cur_words = [w]
+            cur_seg = seg if seg is not None else object()  # None never groups
+    if cur_words:
+        cells.append(" ".join(cur_words))
+    return cells
+
+
+def stitch_cells(seed_pending, cell_lists):
+    """Cross-page stitching at the cell level (mirrors stitch_texts). Each entry
+    is a list of cell strings; continuations are concatenated onto the oldest
+    open top-partial. Returns (completed_cell_lists, still_open_top_partials)."""
+    pending = [list(c) for c in seed_pending]
+    completed = []
+    for cells in cell_lists:
+        tokens = " ".join(cells).split()
+        if not tokens:
+            continue
+        if _is_form_start(tokens):
+            (completed if _is_complete(tokens) else pending).append(list(cells))
+        elif pending:
+            completed.append(pending.pop(0) + list(cells))
+        else:
+            completed.append(list(cells))  # orphan bottom-half -> its own row
+    return completed, pending
+
+
 def _row_sort_key(row):
     rid = row[0]
     return (0, int(rid)) if str(rid).isdigit() else (1, 0)
@@ -171,23 +270,104 @@ def pure_extract(tokens) -> dict:
     }
 
 
-def extract_row(text: str) -> list:
-    """Build one output row (ID + all columns) from a form's OCR text."""
-    # 3. No Extra Spaces & 4. Avoid Double Space
-    tokens = re.sub(r"\s+", " ", text).strip().split()
-    values = pure_extract(tokens)
-    rid = record_id(text) or ""
+def pure_extract_cells(cells) -> dict:
+    """Order-preserving DP over underline cells instead of raw tokens. A field
+    consumes a whole number of consecutive cells (never part of one), so a value
+    can't spill across a column boundary. A field always may take one whole cell
+    even if it is long (one underline = one value); it merges additional cells
+    only while within the field's token budget, which lets a value wrapped over
+    two underline rows ('Lady' + 'Lake') rejoin. With no underlines detected the
+    cells degrade to one word each and this behaves like the token DP. Returns
+    {field_key: value}."""
+    cell_tokens = [c.split() for c in cells]
+    n, m = len(LOCATABLE), len(cells)
+    NEG = float("-inf")
+    dp = [[NEG] * (m + 1) for _ in range(n + 1)]
+    bk = [[0] * (m + 1) for _ in range(n + 1)]
+    dp[0][0] = 0.0
+    for i in range(1, n + 1):
+        key = LOCATABLE[i - 1]
+        cap = SPEC[key][1] + 1  # max tokens for this field
+        for j in range(m + 1):
+            best, bestk = NEG, j
+            toks: list = []
+            for k in range(j, -1, -1):
+                prev = dp[i - 1][k]
+                if prev != NEG:
+                    val = prev + field_score(key, toks)
+                    if val > best:
+                        best, bestk = val, k
+                if k == 0:
+                    break
+                nxt = cell_tokens[k - 1]
+                if toks and len(toks) + len(nxt) > cap:
+                    break  # one whole cell is always allowed; extra cells aren't
+                toks = nxt + toks
+            dp[i][j], bk[i][j] = best, bestk
+
+    groups = [None] * n
+    j = m
+    for i in range(n, 0, -1):
+        k = bk[i][j]
+        groups[i - 1] = (k, j)
+        j = k
+    return {
+        LOCATABLE[i]: canonicalize(
+            LOCATABLE[i],
+            " ".join(t for ci in range(s, e) for t in cell_tokens[ci]).strip(),
+        )
+        for i, (s, e) in enumerate(groups)
+    }
+
+
+def recover_blood_in_text(text, token_boxes, crop):
+    """If the blood group was read as a bare letter (the +/- sign was dropped by
+    OCR), recover the sign from the crop image and splice it back into the token
+    text. The blood group always sits immediately before the Policy No, which
+    anchors its position. Returns the (possibly corrected) text."""
+    tokens = text.split()
+    if not tokens or len(tokens) != len(token_boxes):
+        return text
+    policy_i = None
+    for i, t in enumerate(tokens):
+        if _BLOOD_POLICY_RE.match(t):
+            policy_i = i
+            break
+    if not policy_i:  # None or 0 -> nothing before it
+        return text
+    for bi in (policy_i - 1, policy_i - 2):
+        if bi < 0:
+            continue
+        tok = tokens[bi].upper().strip(".,")
+        if tok in BLOOD_LETTERS:  # bare letter -> sign missing, try to recover it
+            sign = ocr_engine.recover_blood_sign(
+                crop, token_boxes[bi], token_boxes[policy_i][0]
+            )
+            if sign:
+                tokens[bi] = ("O" if tok == "0" else tok) + sign
+                return " ".join(tokens)
+            return text
+        if tok and tok[-1] in "+-" and tok.rstrip("+-") in BLOOD_LETTERS:
+            return text  # already has a sign
+    return text
+
+
+def _build_row(values: dict, full_text: str) -> list:
+    """Turn a {field_key: value} mapping into the final output row (ID first,
+    then every column), applying value clean-up and quality remarks. Shared by
+    the token-based and underline-cell-based extractors."""
+    rid = record_id(full_text) or ""
     row = [rid]
-    
+
     remarks = []
-    
+
     # Pre-process all values
     for key, label in OUTPUT_FIELDS:
         val = values.get(key, "").strip()
-        
+
         # 6. No Inverted Commas
         val = re.sub(r"['\"‘’“”]", "", val)
-        
+
         if ON_FORM.get(key):
             if val:
                 # 1. Phone Number
@@ -195,13 +375,17 @@ def extract_row(text: str) -> list:
                     digits = re.sub(r"\D", "", val)
                     if len(digits) < 10:
                         remarks.append("PHONE NO. INVALID")
-                
+
                 # 2. ZIP Code
                 if "zip" in key.lower():
                     digits = re.sub(r"\D", "", val)
                     if len(digits) < 5:
                         remarks.append("ZIP INVALID")
-        
+
+                # 3. Blood group sign: OCR read the letter but dropped the +/-
+                if key == "blood_group" and val.upper() in {"A", "B", "AB", "O"}:
+                    remarks.append("BLOOD GROUP SIGN MISSING")
+
         values[key] = val
 
     for key, _ in OUTPUT_FIELDS:
@@ -215,8 +399,22 @@ def extract_row(text: str) -> list:
             row.append("")
         else:
             row.append(values.get(key, ""))
-            
+
     return row
+
+
+def extract_row(text: str) -> list:
+    """Build one output row from a form's OCR text (token-window segmentation)."""
+    # 3. No Extra Spaces & 4. Avoid Double Space
+    tokens = re.sub(r"\s+", " ", text).strip().split()
+    return _build_row(pure_extract(tokens), text)
+
+
+def extract_row_from_cells(cells: list) -> list:
+    """Build one output row from a form's underline cells (one underline = one
+    field value), so values cannot spill across columns and wrapped values are
+    merged back together."""
+    return _build_row(pure_extract_cells(cells), " ".join(cells))
 
 
 def gather_images(paths) -> list:
