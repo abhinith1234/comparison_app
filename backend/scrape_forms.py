@@ -1,4 +1,5 @@
 import os
+import time
 from urllib.parse import urljoin
 
 # Use the operating system's trust store (e.g. macOS Keychain) for TLS so that
@@ -36,6 +37,35 @@ BASE_URL = "https://lifeinsdata.com"
 # transient failures (slow reads / 5xx) instead of aborting the whole scrape.
 TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "45"))
 RETRIES = int(os.getenv("SCRAPE_RETRIES", "3"))
+
+
+def retry_request(func, *args, max_retries: int = 3, backoff_factor: float = 1, **kwargs):
+    """
+    Retry a function call up to max_retries times with exponential backoff.
+    
+    Args:
+        func: The function to call
+        *args: Positional arguments for the function
+        max_retries: Maximum number of retry attempts (default: 3)
+        backoff_factor: Multiplier for exponential backoff (default: 1)
+        **kwargs: Keyword arguments for the function
+    
+    Returns:
+        The return value of the function call
+    
+    Raises:
+        The last exception if all retries are exhausted
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries:
+                print(f"Max retries ({max_retries}) reached. Raising exception.")
+                raise
+            wait_time = backoff_factor * (2 ** (attempt - 1))
+            print(f"Attempt {attempt} failed with error: {type(e).__name__}: {str(e)[:100]}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
 
 
 def get_headers(referer: str | None = None) -> dict[str, str]:
@@ -96,7 +126,7 @@ def create_session() -> requests.Session:
 
 def login(session: requests.Session, username: str | None = None, password: str | None = None) -> bool:
     initial_url = BASE_URL
-    session.get(initial_url, headers=get_headers(initial_url), timeout=TIMEOUT)
+    retry_request(session.get, initial_url, headers=get_headers(initial_url), timeout=TIMEOUT)
     print(f"Initialized session with session_id: {session.cookies.get('PHPSESSID')}")
 
     login_url = f"{BASE_URL}/index.php"
@@ -106,7 +136,8 @@ def login(session: requests.Session, username: str | None = None, password: str 
         "utype": "subadmin",
         "login": "SIGN IN",
     }
-    response = session.post(
+    response = retry_request(
+        session.post,
         login_url,
         headers=get_headers(login_url),
         data=data,
@@ -135,28 +166,37 @@ def login(session: requests.Session, username: str | None = None, password: str 
 
 def logout(session: requests.Session) -> bool:
     url = f"{BASE_URL}/LO.php"
-    response = session.get(url, headers=get_headers(url), timeout=TIMEOUT)
+    response = retry_request(session.get, url, headers=get_headers(url), timeout=TIMEOUT)
     return response.ok
 
 
-def get_user_list(session: requests.Session) -> list[str]:
+def logout_with_session_id(session_id: str) -> bool:
+    with create_session() as session:
+        session.cookies.set("PHPSESSID", session_id)
+        url = f"{BASE_URL}/LO.php"
+        response = retry_request(session.get, url, headers=get_headers(url), timeout=10)
+        return response.ok
+
+
+def get_user_list(session: requests.Session) -> list[tuple[str, str]]:
     url = f"{BASE_URL}/entry_list.php"
-    response = session.get(url, headers=get_headers(url), timeout=10)
-    user_list: list[str] = []
+    response = retry_request(session.get, url, headers=get_headers(url), timeout=10)
+    user_list: list[tuple[str, str]] = []
     if response.ok:
         soup = BeautifulSoup(response.content, "html.parser")
         select_element = soup.find("select", id="exampleSelect3")
         if select_element:
             for option in select_element.find_all("option"):
                 value = option.get("value")
+                user_name = option.get_text(strip=True)
                 if value and value != "selectuser":
-                    user_list.append(value)
+                    user_list.append((value, user_name))
     return user_list
 
 
 def get_user_forms(session: requests.Session, user_id: str) -> None:
     url = f"{BASE_URL}/entry_list.php?inq={user_id}&submit="
-    response = session.get(url, headers=get_headers(url), timeout=10)
+    response = retry_request(session.get, url, headers=get_headers(url), timeout=10)
     user_form_links = []
     if response.ok:
         soup = BeautifulSoup(response.content, "html.parser")
@@ -175,7 +215,7 @@ def get_user_forms(session: requests.Session, user_id: str) -> None:
 
 
 def get_form_details(session: requests.Session, form_url: str) -> dict[str, str]:
-    response = session.get(form_url, headers=get_headers(form_url), timeout=10)
+    response = retry_request(session.get, form_url, headers=get_headers(form_url), timeout=30)
     form_details = {}
     if response.ok:
         corrected_response_content = response.text.replace(
@@ -209,7 +249,7 @@ def scrape_all_forms(username: str | None = None, password: str | None = None) -
             )
         try:
             details: list[dict] = []
-            for user_id in get_user_list(session):
+            for user_id, user_name in get_user_list(session):
                 forms = get_user_forms(session, user_id) or []
                 for form_link in forms:
                     details.append(get_form_details(session, form_link))
@@ -217,11 +257,3 @@ def scrape_all_forms(username: str | None = None, password: str | None = None) -
         finally:
             logout(session)
 
-
-if __name__ == "__main__":
-    import json
-
-    records = scrape_all_forms()
-    with open("all_user_forms_details.json", "w") as f:
-        json.dump(records, f, indent=4)
-    print(f"Scraped {len(records)} forms -> all_user_forms_details.json")
